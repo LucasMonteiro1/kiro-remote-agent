@@ -25,6 +25,9 @@ async function main() {
         })
         .catch((err) => logError('push approval_request', err));
     },
+    (noticeText) => {
+      relay.pushError(noticeText).catch((err) => logError('push system notice', err));
+    },
   );
 
   session.start();
