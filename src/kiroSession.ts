@@ -5,6 +5,11 @@ import type { AgentConfig } from './config';
 
 const TERM_COLS = 200;
 const TERM_ROWS = 60;
+// kiro-cli's startup (splash art, MCP/tool loading, resuming session
+// history) reliably takes at least this long; used as a floor below the
+// content-based "still initializing" check so a transitional frame with no
+// recognizable hint text can't be mistaken for "ready".
+const MIN_STARTUP_MS = 4000;
 
 /**
  * Everything KiroSession needs to spawn and identify its underlying
@@ -52,6 +57,12 @@ export class KiroSession {
   private hasSyncedInitialScreen = false;
   private sawApprovalPromptThisTurn = false;
   private lastActivityAt = Date.now();
+  // Messages/keystrokes sent before kiro-cli has finished its startup splash
+  // (still "Initializing...") get swallowed rather than queued by the TUI,
+  // so we hold anything sent before the session is confirmed ready and
+  // flush it once it actually is.
+  private pendingBeforeReady: string[] = [];
+  private readonly startedAt = Date.now();
 
   constructor(
     private readonly config: AgentConfig,
@@ -97,16 +108,25 @@ export class KiroSession {
 
   /** Sends a chat message to the running session, as if typed by the user. */
   sendMessage(text: string): void {
-    if (!this.ptyProcess) throw new Error('KiroSession not started');
-    this.lastActivityAt = Date.now();
-    this.ptyProcess.write(`${text}\r`);
+    this.writeOrQueue(`${text}\r`);
   }
 
   /** Sends raw keystrokes, used to answer an approval prompt (y/n/etc). */
   sendKeystrokes(keystrokes: string): void {
+    this.writeOrQueue(keystrokes);
+  }
+
+  private writeOrQueue(data: string): void {
     if (!this.ptyProcess) throw new Error('KiroSession not started');
     this.lastActivityAt = Date.now();
-    this.ptyProcess.write(keystrokes);
+    if (!this.hasSyncedInitialScreen) {
+      // Still booting (splash/"Initializing..."): queue rather than write,
+      // since kiro-cli's TUI doesn't buffer keystrokes typed during this
+      // phase — they're silently dropped instead of queued for later.
+      this.pendingBeforeReady.push(data);
+      return;
+    }
+    this.ptyProcess.write(data);
   }
 
   /** Milliseconds since the last message/keystroke sent into this session. */
@@ -118,6 +138,15 @@ export class KiroSession {
     this.ptyProcess?.kill();
     this.ptyProcess = null;
     if (this.idleTimer) clearTimeout(this.idleTimer);
+  }
+
+  private flushPendingWrites(): void {
+    if (this.pendingBeforeReady.length === 0) return;
+    const queued = this.pendingBeforeReady;
+    this.pendingBeforeReady = [];
+    for (const data of queued) {
+      this.ptyProcess?.write(data);
+    }
   }
 
   private handleChunk(chunk: string): void {
@@ -135,7 +164,25 @@ export class KiroSession {
    * genuinely new since the last check.
    */
   private onIdle(): void {
-    const { contentLines, noticeText } = this.readScreen();
+    const { contentLines, noticeText, stillInitializing } = this.readScreen();
+
+    // Between the "Launching..." splash and the "Initializing..." status
+    // bar there's a brief transitional frame that matches neither hint —
+    // if the idle timer happens to fire in that gap we'd wrongly think the
+    // session is ready. Enforce a minimum warm-up window regardless of
+    // screen content, since kiro-cli's startup reliably takes a few
+    // seconds no matter what.
+    const stillWarmingUp = !this.hasSyncedInitialScreen && Date.now() - this.startedAt < MIN_STARTUP_MS;
+
+    if (stillInitializing || stillWarmingUp) {
+      // Splash/"Initializing..." screen has gone idle (no more data for a
+      // beat) but kiro-cli isn't actually ready to accept input yet. Keep
+      // waiting rather than syncing our baseline or flushing queued writes
+      // against a screen that will still change.
+      this.idleTimer = setTimeout(() => this.onIdle(), this.config.IDLE_MS_BEFORE_TURN_COMPLETE);
+      return;
+    }
+
     const screenText = contentLines.join('\n').trim();
 
     if (this.config.approvalPromptRegex.test(screenText) && !this.sawApprovalPromptThisTurn) {
@@ -152,6 +199,7 @@ export class KiroSession {
       this.hasSyncedInitialScreen = true;
       this.lastScreenLines = contentLines;
       this.lastSystemNotice = noticeText;
+      this.flushPendingWrites();
       return;
     }
 
@@ -179,13 +227,19 @@ export class KiroSession {
    * - noticeText: a system notice line if one is currently showing (auth
    *   required, MCP failures, quota reached), or null
    */
-  private readScreen(): { contentLines: string[]; noticeText: string | null } {
+  private readScreen(): { contentLines: string[]; noticeText: string | null; stillInitializing: boolean } {
     const buffer = this.terminal.buffer.active;
     const rawLines: string[] = [];
     for (let i = 0; i < this.terminal.rows; i++) {
       const line = buffer.getLine(buffer.viewportY + i);
       if (line) rawLines.push(line.translateToString(true));
     }
+
+    // kiro-cli's startup splash (logo, "Launching...", "Initializing...")
+    // does not buffer keystrokes typed during it — anything sent while
+    // this is showing is silently dropped rather than queued. Detect it
+    // from the raw (pre-filter) lines so we know not to write/flush yet.
+    const stillInitializing = rawLines.some((line) => INITIALIZING_HINT.test(line));
 
     let noticeText: string | null = null;
     const contentLines: string[] = [];
@@ -209,7 +263,7 @@ export class KiroSession {
     while (contentLines.length > 0 && contentLines[0] === '') contentLines.shift();
     while (contentLines.length > 0 && contentLines[contentLines.length - 1] === '') contentLines.pop();
 
-    return { contentLines, noticeText };
+    return { contentLines, noticeText, stillInitializing };
   }
 
   private log(text: string, raw = false): void {
@@ -245,6 +299,11 @@ function arraysEqual(a: string[], b: string[]): boolean {
   return a.every((value, index) => value === b[index]);
 }
 
+// Matches kiro-cli's startup splash state ("Launching...", the status-bar
+// "Initializing..." label, and the "Initializing · type to queue a
+// message" hint) — input sent while any of these show is dropped, not
+// queued, so we must wait past this before writing/flushing anything.
+const INITIALIZING_HINT = /(Launching\.\.\.|●\s*Initializing\.\.\.|Initializing\s*·)/;
 const BOX_DRAWING_RULE = /^[─━═\s]+$/;
 const STATUS_BAR_HINT =
   /^\s*(ask a question or describe a task|\/copy to clipboard|type to queue a message|Initializing|Kiro is working|Type to steer|Ctrl\+S to queue)/i;
@@ -254,7 +313,7 @@ const SPLASH_BANNER_TEXT =
   /(An early release of Kiro CLI|What's new:|^\s*Tip:|https:\/\/kiro\.dev\/docs\/)/i;
 // System-level notices (auth required, MCP issues, quota) shown in the
 // status area — surfaced separately via onSystemNotice, not as chat text.
-const SYSTEM_NOTICE = /(requires OAuth|MCP failures|monthly usage limit has been reached)/i;
+const SYSTEM_NOTICE = /(requires OAuth|MCP failures|monthly usage limit)/i;
 // Braille block characters (U+2800-28FF) make up kiro-cli's startup ASCII-art
 // logo. Any line where they're a large share of the non-space characters is
 // splash art, not real conversation content.
