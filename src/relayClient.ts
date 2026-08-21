@@ -2,16 +2,20 @@ import type { AgentConfig } from './config';
 import type { SessionMessage, SessionSummary } from './sessionScanner';
 
 export type RelayEvent =
-  | { id: string; type: 'user_message'; text: string; createdAt: number }
+  | { id: string; type: 'user_message'; text: string; createdAt: number; sessionId?: string }
   | {
       id: string;
       type: 'approval_response';
       requestId: string;
       decision: 'approve' | 'deny' | 'approve_always';
       createdAt: number;
+      sessionId?: string;
     };
 
 export class RelayClient {
+  // A single cursor is fine: /api/agent/pull returns events across every
+  // chat thread (default + all open local sessions), each already tagged
+  // with its own sessionId, so index.ts can dispatch them locally.
   private cursor = 0;
 
   constructor(private readonly config: AgentConfig) {}
@@ -36,21 +40,21 @@ export class RelayClient {
     return body.events;
   }
 
-  async pushAssistantMessage(text: string): Promise<void> {
-    await this.push({ type: 'assistant_message', text });
+  async pushAssistantMessage(text: string, sessionId?: string): Promise<void> {
+    await this.push({ type: 'assistant_message', text, sessionId });
   }
 
-  async pushStatus(text: string): Promise<void> {
-    await this.push({ type: 'status', text });
+  async pushStatus(text: string, sessionId?: string): Promise<void> {
+    await this.push({ type: 'status', text, sessionId });
   }
 
-  async pushError(text: string): Promise<void> {
-    await this.push({ type: 'error', text });
+  async pushError(text: string, sessionId?: string): Promise<void> {
+    await this.push({ type: 'error', text, sessionId });
   }
 
   /** Returns the relay-assigned id of the created approval_request event. */
-  async pushApprovalRequest(promptText: string, toolName?: string): Promise<string> {
-    const event = await this.push({ type: 'approval_request', promptText, toolName });
+  async pushApprovalRequest(promptText: string, sessionId?: string, toolName?: string): Promise<string> {
+    const event = await this.push({ type: 'approval_request', promptText, toolName, sessionId });
     return event.id;
   }
 
@@ -97,6 +101,7 @@ export class RelayClient {
     requestId: string,
     sessionId: string,
     title: string,
+    status: string | null,
     messages: SessionMessage[],
     truncated: boolean,
   ): Promise<void> {
@@ -107,7 +112,7 @@ export class RelayClient {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${this.config.AGENT_SHARED_SECRET}`,
       },
-      body: JSON.stringify({ requestId, sessionId, title, messages, truncated }),
+      body: JSON.stringify({ requestId, sessionId, title, status, messages, truncated }),
     });
 
     if (!res.ok) {
@@ -117,10 +122,10 @@ export class RelayClient {
 
   private async push(
     payload:
-      | { type: 'assistant_message'; text: string }
-      | { type: 'status'; text: string }
-      | { type: 'error'; text: string }
-      | { type: 'approval_request'; promptText: string; toolName?: string },
+      | { type: 'assistant_message'; text: string; sessionId?: string }
+      | { type: 'status'; text: string; sessionId?: string }
+      | { type: 'error'; text: string; sessionId?: string }
+      | { type: 'approval_request'; promptText: string; toolName?: string; sessionId?: string },
   ): Promise<{ id: string }> {
     const url = new URL('/api/agent/push', this.config.RELAY_URL);
     const res = await fetch(url, {

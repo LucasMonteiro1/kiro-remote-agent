@@ -86,6 +86,7 @@ export function scanSessionSummaries(): SessionSummary[] {
  */
 export function readSessionTranscript(sessionId: string): {
   title: string;
+  status: string | null;
   messages: SessionMessage[];
   truncated: boolean;
 } | null {
@@ -93,11 +94,13 @@ export function readSessionTranscript(sessionId: string): {
   if (!sessionDir) return null;
 
   let title = '';
+  let status: string | null = null;
   try {
     const sessionJson = JSON.parse(readFileSync(join(sessionDir, 'session.json'), 'utf8'));
     title = String(sessionJson.title ?? '');
+    status = typeof sessionJson.status === 'string' ? sessionJson.status : null;
   } catch {
-    // best-effort; title stays empty
+    // best-effort; title/status stay empty
   }
 
   let rawLines: string[];
@@ -105,7 +108,7 @@ export function readSessionTranscript(sessionId: string): {
     const content = readFileSync(join(sessionDir, 'messages.jsonl'), 'utf8');
     rawLines = content.split('\n').filter((line) => line.trim().length > 0);
   } catch {
-    return { title, messages: [], truncated: false };
+    return { title, status, messages: [], truncated: false };
   }
 
   const allMessages: SessionMessage[] = [];
@@ -117,7 +120,32 @@ export function readSessionTranscript(sessionId: string): {
   const truncated = allMessages.length > MAX_MESSAGES_PER_SESSION;
   const messages = truncated ? allMessages.slice(-MAX_MESSAGES_PER_SESSION) : allMessages;
 
-  return { title, messages, truncated };
+  return { title, status, messages, truncated };
+}
+
+/**
+ * Reads a session's own session.json (workspacePaths + current status),
+ * used when the daemon needs to spawn/resume a kiro-cli process for a
+ * specific session id opened from the phone's session viewer.
+ */
+export function getSessionInfo(
+  sessionId: string,
+): { workspacePaths: string[]; status: string | null } | null {
+  const sessionDir = findSessionDir(sessionId);
+  if (!sessionDir) return null;
+
+  try {
+    const parsed = JSON.parse(readFileSync(join(sessionDir, 'session.json'), 'utf8')) as Record<
+      string,
+      unknown
+    >;
+    return {
+      workspacePaths: Array.isArray(parsed.workspacePaths) ? parsed.workspacePaths.map(String) : [],
+      status: typeof parsed.status === 'string' ? parsed.status : null,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function findSessionDir(sessionId: string): string | null {

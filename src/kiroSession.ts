@@ -7,6 +7,21 @@ const TERM_COLS = 200;
 const TERM_ROWS = 60;
 
 /**
+ * Everything KiroSession needs to spawn and identify its underlying
+ * kiro-cli process. Split out from AgentConfig so the same class can be
+ * used both for the daemon's one fixed "default" chat and for on-demand
+ * sessions the phone opens from the session viewer (each with its own
+ * working directory and --resume-id).
+ */
+export interface KiroSessionOptions {
+  /** Label used only in debug log lines, e.g. "default" or the session id. */
+  label: string;
+  cwd: string;
+  /** If set, resumes this specific session id; otherwise resumes the most recent session in `cwd`. */
+  resumeSessionId?: string;
+}
+
+/**
  * Wraps an interactive kiro-cli process in a pseudo-terminal.
  *
  * We deliberately run kiro-cli interactively (not `--no-interactive`)
@@ -36,20 +51,23 @@ export class KiroSession {
   private lastSystemNotice: string | null = null;
   private hasSyncedInitialScreen = false;
   private sawApprovalPromptThisTurn = false;
+  private lastActivityAt = Date.now();
 
   constructor(
     private readonly config: AgentConfig,
+    private readonly options: KiroSessionOptions,
     private readonly onTurnOutput: (text: string) => void,
     private readonly onApprovalPromptDetected: (promptText: string) => void,
     private readonly onSystemNotice: (text: string) => void,
+    private readonly onExit?: (exitCode: number) => void,
   ) {
     this.terminal = new Terminal({ cols: TERM_COLS, rows: TERM_ROWS, allowProposedApi: true });
   }
 
   start(): void {
     const args = ['chat'];
-    if (this.config.KIRO_SESSION_ID) {
-      args.push('--resume-id', this.config.KIRO_SESSION_ID);
+    if (this.options.resumeSessionId) {
+      args.push('--resume-id', this.options.resumeSessionId);
     } else {
       args.push('--resume');
     }
@@ -57,13 +75,13 @@ export class KiroSession {
       args.push(`--trust-tools=${this.config.trustToolsList.join(',')}`);
     }
 
-    this.log(`Starting: ${this.config.KIRO_CLI_BIN} ${args.join(' ')}`);
+    this.log(`[${this.options.label}] Starting: ${this.config.KIRO_CLI_BIN} ${args.join(' ')} (cwd=${this.options.cwd})`);
 
     this.ptyProcess = pty.spawn(this.config.KIRO_CLI_BIN, args, {
       name: 'xterm-color',
       cols: TERM_COLS,
       rows: TERM_ROWS,
-      cwd: this.config.KIRO_PROJECT_DIR,
+      cwd: this.options.cwd,
       env: {
         ...process.env,
         ...(this.config.KIRO_API_KEY ? { KIRO_API_KEY: this.config.KIRO_API_KEY } : {}),
@@ -72,20 +90,28 @@ export class KiroSession {
 
     this.ptyProcess.onData((chunk) => this.handleChunk(chunk));
     this.ptyProcess.onExit(({ exitCode, signal }) => {
-      this.log(`kiro-cli exited: code=${exitCode} signal=${signal}`);
+      this.log(`[${this.options.label}] kiro-cli exited: code=${exitCode} signal=${signal}`);
+      this.onExit?.(exitCode);
     });
   }
 
   /** Sends a chat message to the running session, as if typed by the user. */
   sendMessage(text: string): void {
     if (!this.ptyProcess) throw new Error('KiroSession not started');
+    this.lastActivityAt = Date.now();
     this.ptyProcess.write(`${text}\r`);
   }
 
   /** Sends raw keystrokes, used to answer an approval prompt (y/n/etc). */
   sendKeystrokes(keystrokes: string): void {
     if (!this.ptyProcess) throw new Error('KiroSession not started');
+    this.lastActivityAt = Date.now();
     this.ptyProcess.write(keystrokes);
+  }
+
+  /** Milliseconds since the last message/keystroke sent into this session. */
+  idleForMs(): number {
+    return Date.now() - this.lastActivityAt;
   }
 
   stop(): void {
@@ -140,6 +166,7 @@ export class KiroSession {
 
     const newText = newLines.join('\n').trim();
     if (newText.length > 0) {
+      this.lastActivityAt = Date.now();
       this.onTurnOutput(newText);
     }
   }
