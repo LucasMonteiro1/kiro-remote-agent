@@ -7,12 +7,14 @@
     "kiro-remote-agent": "dist/index.js"
   },
   "scripts": {
+    "postinstall": "node -e \"try{require('fs').chmodSync(require.resolve('node-pty/prebuilds/'+process.platform+'-'+process.arch+'/spawn-helper'),0o755)}catch(e){}\"",
     "dev": "tsx src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@xterm/headless": "^6.0.0",
     "dotenv": "^16.4.5",
     "node-pty": "^1.0.0",
     "zod": "^3.23.8"

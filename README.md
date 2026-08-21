@@ -76,6 +76,14 @@ yarn build
 yarn start
 ```
 
+> **Nota (macOS):** o binário pré-compilado do `node-pty` (`spawn-helper`)
+> às vezes perde a permissão de execução após o `yarn install`, causando o
+> erro `posix_spawnp failed`. Um script `postinstall` já corrige isso
+> automaticamente; se ainda assim ocorrer, rode:
+> ```bash
+> chmod +x node_modules/node-pty/prebuilds/darwin-*/spawn-helper
+> ```
+
 Para desenvolvimento (com reload via tsx, sem precisar de build):
 
 ```bash
@@ -86,6 +94,7 @@ yarn dev
 
 | Variável                        | Descrição                                                                    |
 | -------------------------------- | ------------------------------------------------------------------------------ |
+| `KIRO_CLI_BIN`                    | Caminho do binário `kiro-cli`. Se for rodar via `pm2`/`launchd` (PATH restrito), use o caminho absoluto (ex: `/Users/voce/.local/bin/kiro-cli`) |
 | `RELAY_URL`                      | URL do seu kiro-remote-relay deployado (ex: `https://kiro-remote.vercel.app`)  |
 | `AGENT_SHARED_SECRET`            | Deve ser **idêntico** ao configurado no relay                                 |
 | `HOST_LABEL`                     | Nome amigável exibido no celular (ex: `work-macbook`)                         |
