@@ -1,0 +1,28 @@
+{
+  "name": "kiro-remote-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local daemon that bridges a kiro-cli session to the kiro-remote-relay, so you can keep chatting with your Kiro agent from your phone while it keeps running on your work machine.",
+  "bin": {
+    "kiro-remote-agent": "dist/index.js"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "node-pty": "^1.0.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.15",
+    "tsx": "^4.19.1",
+    "typescript": "^5.5.4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
