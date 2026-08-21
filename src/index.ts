@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { loadConfig } from './config';
 import { RelayClient } from './relayClient';
 import { KiroSession } from './kiroSession';
+import { scanSessionSummaries, readSessionTranscript } from './sessionScanner';
 
 async function main() {
   const config = loadConfig();
@@ -55,6 +56,46 @@ async function main() {
   }
 
   pollLoop();
+
+  // --- Local Kiro IDE session history tracking (read-only, ~/.kiro/sessions) ---
+  let sessionDetailCursor = 0;
+
+  async function sessionScanLoop() {
+    try {
+      const summaries = scanSessionSummaries();
+      await relay.pushLocalSessions(summaries);
+    } catch (err) {
+      logError('session scan loop', err);
+    } finally {
+      setTimeout(sessionScanLoop, config.SESSION_SCAN_INTERVAL_MS);
+    }
+  }
+
+  async function sessionDetailLoop() {
+    try {
+      const requests = await relay.pullSessionDetailRequests(sessionDetailCursor);
+      for (const req of requests) {
+        sessionDetailCursor = Math.max(sessionDetailCursor, req.createdAt);
+        const detail = readSessionTranscript(req.sessionId);
+        if (detail) {
+          await relay.pushSessionDetailResult(
+            req.id,
+            req.sessionId,
+            detail.title,
+            detail.messages,
+            detail.truncated,
+          );
+        }
+      }
+    } catch (err) {
+      logError('session detail loop', err);
+    } finally {
+      setTimeout(sessionDetailLoop, config.POLL_INTERVAL_MS);
+    }
+  }
+
+  sessionScanLoop();
+  sessionDetailLoop();
 
   process.on('SIGINT', () => shutdown(session));
   process.on('SIGTERM', () => shutdown(session));

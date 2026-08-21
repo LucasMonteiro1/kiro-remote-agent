@@ -1,4 +1,5 @@
 import type { AgentConfig } from './config';
+import type { SessionMessage, SessionSummary } from './sessionScanner';
 
 export type RelayEvent =
   | { id: string; type: 'user_message'; text: string; createdAt: number }
@@ -51,6 +52,67 @@ export class RelayClient {
   async pushApprovalRequest(promptText: string, toolName?: string): Promise<string> {
     const event = await this.push({ type: 'approval_request', promptText, toolName });
     return event.id;
+  }
+
+  /** Overwrites the relay's snapshot of local Kiro IDE sessions. */
+  async pushLocalSessions(sessions: SessionSummary[]): Promise<void> {
+    const url = new URL('/api/agent/local-sessions', this.config.RELAY_URL);
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.config.AGENT_SHARED_SECRET}`,
+      },
+      body: JSON.stringify({ sessions }),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Relay pushLocalSessions failed: ${res.status} ${await safeText(res)}`);
+    }
+  }
+
+  /** Polls for pending "fetch this session's transcript" requests from the phone. */
+  async pullSessionDetailRequests(
+    sinceMs: number,
+  ): Promise<{ id: string; sessionId: string; createdAt: number }[]> {
+    const url = new URL('/api/agent/session-detail-requests', this.config.RELAY_URL);
+    url.searchParams.set('since', String(sinceMs));
+
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${this.config.AGENT_SHARED_SECRET}` },
+    });
+
+    if (!res.ok) {
+      throw new Error(`Relay pullSessionDetailRequests failed: ${res.status} ${await safeText(res)}`);
+    }
+
+    const body = (await res.json()) as {
+      requests: { id: string; sessionId: string; createdAt: number }[];
+    };
+    return body.requests;
+  }
+
+  /** Posts a session transcript back to the relay in response to a detail request. */
+  async pushSessionDetailResult(
+    requestId: string,
+    sessionId: string,
+    title: string,
+    messages: SessionMessage[],
+    truncated: boolean,
+  ): Promise<void> {
+    const url = new URL('/api/agent/session-detail-result', this.config.RELAY_URL);
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.config.AGENT_SHARED_SECRET}`,
+      },
+      body: JSON.stringify({ requestId, sessionId, title, messages, truncated }),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Relay pushSessionDetailResult failed: ${res.status} ${await safeText(res)}`);
+    }
   }
 
   private async push(

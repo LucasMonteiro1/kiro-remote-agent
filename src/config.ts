@@ -11,6 +11,8 @@ const envSchema = z.object({
   AGENT_SHARED_SECRET: z.string().min(16),
   HOST_LABEL: z.string().default('work-pc'),
   POLL_INTERVAL_MS: z.coerce.number().int().positive().default(4000),
+  /** How often (ms) to scan ~/.kiro/sessions and push a fresh summary snapshot to the relay. */
+  SESSION_SCAN_INTERVAL_MS: z.coerce.number().int().positive().default(45000),
 
   // --- kiro-cli process ---
   KIRO_CLI_BIN: z.string().default('kiro-cli'),
