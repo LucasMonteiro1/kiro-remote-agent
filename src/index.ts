@@ -2,16 +2,11 @@ import 'dotenv/config';
 import { loadConfig } from './config';
 import { RelayClient } from './relayClient';
 import { KiroSession } from './kiroSession';
-import { SessionManager } from './sessionManager';
 import { scanSessionSummaries, readSessionTranscript } from './sessionScanner';
-
-const IDLE_SESSION_TTL_MS = 30 * 60 * 1000; // stop on-demand kiro-cli processes after 30 min of no activity
-const IDLE_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
 async function main() {
   const config = loadConfig();
   const relay = new RelayClient(config);
-  const sessionManager = new SessionManager(config, relay);
 
   // requestId -> resolve callback, used to route an approval decision from
   // the phone back into a "send keystrokes to the PTY" action.
@@ -43,23 +38,20 @@ async function main() {
     try {
       const events = await relay.pull();
       for (const event of events) {
-        // No sessionId means the default chat (the daemon's fixed
-        // KIRO_PROJECT_DIR session); a concrete sessionId targets an
-        // on-demand session opened from the phone's session viewer.
+        // Events tagged with a sessionId target a Kiro IDE chat session.
+        // Those are delivered by the Kiro Remote Bridge extension running
+        // inside the IDE (see ide-extension/), because an IDE-owned session
+        // can only be driven by the IDE's own agent client — spawning a
+        // separate kiro-cli here would create a disconnected process that
+        // never shows up in the IDE and loses its MCP context.
+        if (event.sessionId) continue;
+
         if (event.type === 'user_message') {
-          if (event.sessionId) {
-            sessionManager.sendMessage(event.sessionId, event.text);
-          } else {
-            session.sendMessage(event.text);
-          }
+          session.sendMessage(event.text);
         } else if (event.type === 'approval_response') {
-          if (event.sessionId) {
-            sessionManager.applyApprovalDecision(event.sessionId, event.requestId, event.decision);
-          } else {
-            const targetId = event.requestId || lastApprovalRequestId;
-            if (targetId) {
-              applyApprovalDecision(session, config, event.decision);
-            }
+          const targetId = event.requestId || lastApprovalRequestId;
+          if (targetId) {
+            applyApprovalDecision(session, config, event.decision);
           }
         }
       }
@@ -71,8 +63,6 @@ async function main() {
   }
 
   pollLoop();
-
-  setInterval(() => sessionManager.evictIdleSessions(IDLE_SESSION_TTL_MS), IDLE_SWEEP_INTERVAL_MS);
 
   // --- Local Kiro IDE session history tracking (read-only, ~/.kiro/sessions) ---
   let sessionDetailCursor = 0;
@@ -93,7 +83,7 @@ async function main() {
       const requests = await relay.pullSessionDetailRequests(sessionDetailCursor);
       for (const req of requests) {
         sessionDetailCursor = Math.max(sessionDetailCursor, req.createdAt);
-        const detail = readSessionTranscript(req.sessionId);
+        const detail = readSessionTranscript(req.sessionId, req.sinceTimestamp);
         if (detail) {
           await relay.pushSessionDetailResult(
             req.id,
@@ -115,8 +105,8 @@ async function main() {
   sessionScanLoop();
   sessionDetailLoop();
 
-  process.on('SIGINT', () => shutdown(session, sessionManager));
-  process.on('SIGTERM', () => shutdown(session, sessionManager));
+  process.on('SIGINT', () => shutdown(session));
+  process.on('SIGTERM', () => shutdown(session));
 }
 
 function applyApprovalDecision(
@@ -137,9 +127,8 @@ function applyApprovalDecision(
   }
 }
 
-function shutdown(session: KiroSession, sessionManager: SessionManager): void {
+function shutdown(session: KiroSession): void {
   session.stop();
-  sessionManager.stopAll();
   process.exit(0);
 }
 

@@ -1,0 +1,64 @@
+{
+  "name": "kiro-remote-bridge",
+  "displayName": "Kiro Remote Bridge",
+  "description": "Bridges your kiro-remote-relay to this Kiro IDE window, so you can reply to IDE chat sessions from your phone.",
+  "version": "0.1.0",
+  "publisher": "lucasmonteiro",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Kiro Remote Bridge",
+      "properties": {
+        "kiroRemoteBridge.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Poll the relay and deliver remote replies into this window's Kiro chat sessions."
+        },
+        "kiroRemoteBridge.relayUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Base URL of your deployed kiro-remote-relay, e.g. https://kiro-remote-relay.vercel.app"
+        },
+        "kiroRemoteBridge.agentSecret": {
+          "type": "string",
+          "default": "",
+          "description": "Must match AGENT_SHARED_SECRET on the relay. Stored in your local settings \u2014 keep this machine trusted."
+        },
+        "kiroRemoteBridge.pollIntervalMs": {
+          "type": "number",
+          "default": 4000,
+          "description": "How often (ms) to poll the relay for new remote messages."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "kiroRemoteBridge.showStatus",
+        "title": "Kiro Remote Bridge: Show Status"
+      },
+      {
+        "command": "kiroRemoteBridge.showLog",
+        "title": "Kiro Remote Bridge: Show Log"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.15",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.5.4"
+  }
+}
