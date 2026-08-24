@@ -83,7 +83,7 @@ async function main() {
       const requests = await relay.pullSessionDetailRequests(sessionDetailCursor);
       for (const req of requests) {
         sessionDetailCursor = Math.max(sessionDetailCursor, req.createdAt);
-        const detail = readSessionTranscript(req.sessionId, req.sinceTimestamp);
+        const detail = readSessionTranscript(req.sessionId);
         if (detail) {
           await relay.pushSessionDetailResult(
             req.id,
