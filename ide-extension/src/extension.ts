@@ -43,6 +43,8 @@ const RECENT_WINDOW_MS = 24 * 60 * 60 * 1000;
 const MAX_WATCHED_SESSIONS = 12;
 /** Window for matching a file entry against a message we just delivered. */
 const ECHO_WINDOW_MS = 90 * 1000;
+/** How long to wait for the IDE to confirm a dispatched approval decision actually resolved the tool call. */
+const APPROVAL_CONFIRM_TIMEOUT_MS = 6000;
 
 let output: vscode.OutputChannel;
 let pollTimer: NodeJS.Timeout | undefined;
@@ -59,6 +61,10 @@ interface RelayEvent {
   text?: string;
   createdAt: number;
   sessionId?: string;
+  /** Only present on approval_response events: the approval_request id it answers. */
+  requestId?: string;
+  /** Only present on approval_response events. */
+  decision?: string;
 }
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -206,11 +212,15 @@ async function pollLoop(context: vscode.ExtensionContext): Promise<void> {
     const events = await pull(config.relayUrl, config.agentSecret);
     lastPollError = null;
     for (const event of events) {
-      // Only remote chat messages aimed at a specific local session are ours.
-      // Untagged events belong to the daemon's own separate chat; approvals
-      // for IDE sessions are handled by the IDE's own UI.
-      if (event.type !== 'user_message' || !event.sessionId || !event.text) continue;
-      await handleRemoteMessage(config, event.sessionId, event.text, event.id);
+      // Untagged events belong to the daemon's own separate default chat, not
+      // any local IDE session — nothing here is ours to act on.
+      if (!event.sessionId) continue;
+
+      if (event.type === 'user_message' && event.text) {
+        await handleRemoteMessage(config, event.sessionId, event.text, event.id);
+      } else if (event.type === 'approval_response' && event.requestId && event.decision) {
+        await handleRemoteApprovalResponse(config, event.sessionId, event.requestId, event.decision, event.id);
+      }
     }
   } catch (err) {
     lastPollError = describeError(err);
@@ -282,6 +292,107 @@ async function handleRemoteMessage(
   }
 }
 
+/**
+ * Delivers an approval decision from the phone into this window's IDE.
+ *
+ * The commands the IDE exposes for this (`kiroAgent.execution.trust`,
+ * `.rejectAll`, `.runOrAcceptAll`) don't take a session id — they act on
+ * whichever chat panel is currently focused. That makes this inherently
+ * riskier than sending a prompt (which does take a session id): if two
+ * approvals raced, or something changed the focused panel mid-flight, the
+ * wrong session's prompt could get resolved. Three things guard against
+ * that:
+ *  - `approvalQueue` serializes dispatches in this window one at a time.
+ *  - `pendingApprovals` is checked before dispatching, so we only act on a
+ *    prompt this window actually knows is outstanding for that toolCallId.
+ *  - After dispatching we `viewSession` first (so the panel is definitely
+ *    the right one) and then wait for the matching `interaction_resolved`
+ *    entry to actually land in that session's transcript, confirming the
+ *    right prompt was the one resolved rather than assuming the command
+ *    worked.
+ */
+async function handleRemoteApprovalResponse(
+  config: BridgeConfig,
+  sessionId: string,
+  requestId: string,
+  decision: string,
+  eventId: string,
+): Promise<void> {
+  if (!sessionBelongsToThisWindow(sessionId)) return;
+
+  const pending = pendingApprovals.get(requestId);
+  if (!pending || pending.sessionId !== sessionId) {
+    // Either this window never streamed the originating prompt, or it was
+    // already resolved (e.g. answered directly in the IDE). Nothing to do.
+    return;
+  }
+
+  const claimed = await claim(config.relayUrl, config.agentSecret, eventId);
+  if (!claimed) return;
+
+  const command = approvalCommandForDecision(decision);
+  if (!command) {
+    log(`Unknown approval decision "${decision}" for ${shortId(sessionId)}, ignoring.`);
+    return;
+  }
+
+  approvalQueue = approvalQueue.then(() => dispatchApprovalDecision(config, sessionId, requestId, command));
+  await approvalQueue;
+}
+
+function approvalCommandForDecision(decision: string): string | undefined {
+  switch (decision) {
+    case 'approve':
+      return 'kiroAgent.execution.runOrAcceptAll';
+    case 'approve_always':
+      return 'kiroAgent.execution.trust';
+    case 'deny':
+      return 'kiroAgent.execution.rejectAll';
+    default:
+      return undefined;
+  }
+}
+
+async function dispatchApprovalDecision(
+  config: BridgeConfig,
+  sessionId: string,
+  requestId: string,
+  command: string,
+): Promise<void> {
+  try {
+    // Make sure the right panel is focused before firing a command that acts
+    // on "the currently active panel" rather than a session id.
+    await vscode.commands.executeCommand('kiroAgent.viewSession', sessionId);
+    await vscode.commands.executeCommand(command);
+    log(`Dispatched ${command} for ${shortId(sessionId)} (request ${shortId(requestId)})`);
+
+    const confirmed = await waitForApprovalResolved(requestId, APPROVAL_CONFIRM_TIMEOUT_MS);
+    if (!confirmed) {
+      log(`Approval ${shortId(requestId)} on ${shortId(sessionId)} was not confirmed resolved within ${APPROVAL_CONFIRM_TIMEOUT_MS}ms.`);
+      await pushError(
+        config,
+        sessionId,
+        'Não foi possível confirmar que a aprovação foi aplicada no IDE. Verifique a sessão diretamente.',
+      );
+    }
+  } catch (err) {
+    const message = describeError(err);
+    log(`Failed to dispatch ${command} for ${shortId(sessionId)}: ${message}`);
+    await pushError(config, sessionId, `Falha ao aplicar aprovação no Kiro IDE: ${message}`);
+  }
+}
+
+/** Polls until `pendingApprovals` no longer has this entry (cleared by the matching interaction_resolved), or times out. */
+async function waitForApprovalResolved(requestId: string, timeoutMs: number): Promise<boolean> {
+  const pollStep = 300;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!pendingApprovals.has(requestId)) return true;
+    await new Promise((resolve) => setTimeout(resolve, pollStep));
+  }
+  return !pendingApprovals.has(requestId);
+}
+
 // --- streaming the IDE's answer back to the phone ---
 
 interface SessionWatcher {
@@ -292,6 +403,24 @@ interface SessionWatcher {
 const watchers = new Map<string, SessionWatcher>();
 /** Messages this window delivered, so the file echo of them isn't re-sent. */
 const recentlyDelivered: { sessionId: string; text: string; at: number }[] = [];
+
+/**
+ * Tracks tool approval prompts this window has surfaced to the relay, so an
+ * approval_response from the phone (which only carries the relay's own
+ * event id) can be mapped back to the Kiro-side toolCallId it answers.
+ * Cleared once the interaction resolves, one way or another.
+ */
+const pendingApprovals = new Map<string, { sessionId: string; toolCallId: string }>();
+/** toolCallId -> display title, filled in from the preceding tool_call entry so the approval card can show what's being approved. */
+const toolTitleByCallId = new Map<string, string>();
+/**
+ * Serializes approval dispatches within this window. The IDE's
+ * trust/rejectAll/runOrAcceptAll commands act on "whichever chat panel is
+ * currently active" rather than a specific session id, so two decisions
+ * racing each other could resolve the wrong session's prompt if run
+ * concurrently.
+ */
+let approvalQueue: Promise<void> = Promise.resolve();
 
 /**
  * Keeps the set of streamed sessions in sync with what's actually active in
@@ -399,15 +528,82 @@ function forwardLine(config: BridgeConfig, sessionId: string, line: string): voi
 
   if (type === 'assistant') {
     const text = String(payload.content ?? '').trim();
-    if (text) void push(config, { type: 'assistant_message', text, sessionId });
+    if (!text) return;
+    // Kiro writes both the model's internal reasoning and its actual reply as
+    // `assistant` entries; `operationType` is the only thing that separates
+    // them ("Reasoning" vs "Say"). Forwarding them as distinct event types is
+    // what lets the phone collapse thinking the way the IDE does instead of
+    // showing it as a second answer bubble.
+    const isReasoning = String(payload.operationType ?? '') === 'Reasoning';
+    void push(config, {
+      type: isReasoning ? 'thought' : 'assistant_message',
+      text,
+      sessionId,
+    });
     return;
   }
 
   if (type === 'tool_call') {
-    const label = String(payload.title ?? payload.toolName ?? 'tool');
-    void push(config, { type: 'status', text: `● ${label}`.slice(0, 490), sessionId });
+    const title = String(payload.title ?? payload.toolName ?? 'tool');
+    const toolName = payload.toolName ? String(payload.toolName) : undefined;
+    // Kept so a later pending_interaction (which only carries the same
+    // toolCallId, not a human-readable title) can show what's being approved.
+    const toolCallId = typeof payload.toolCallId === 'string' ? payload.toolCallId : undefined;
+    if (toolCallId) toolTitleByCallId.set(toolCallId, title);
+    void push(config, {
+      type: 'tool_call',
+      title: title.slice(0, 490),
+      ...(toolName ? { toolName: toolName.slice(0, 200) } : {}),
+      sessionId,
+    });
+    return;
+  }
+
+  if (type === 'pending_interaction' && payload.interactionType === 'tool_approval') {
+    const toolCallId = typeof payload.toolCallId === 'string' ? payload.toolCallId : undefined;
+    if (!toolCallId) return;
+    const question = typeof payload.question === 'string' ? payload.question : 'tool_approval';
+    const title = toolTitleByCallId.get(toolCallId);
+    void push(config, {
+      type: 'approval_request',
+      promptText: question,
+      ...(title ? { toolName: title } : {}),
+      sessionId,
+    }).then((relayEventId) => {
+      if (relayEventId) pendingApprovals.set(relayEventId, { sessionId, toolCallId });
+    });
+    return;
+  }
+
+  if (type === 'interaction_resolved') {
+    const toolCallId = typeof payload.toolCallId === 'string' ? payload.toolCallId : undefined;
+    if (!toolCallId) return;
+    // The developer answered this prompt directly in the IDE (rather than
+    // from the phone) — find our matching pending entry, if any, so the
+    // phone doesn't keep showing it as unresolved.
+    for (const [relayEventId, entry] of pendingApprovals) {
+      if (entry.toolCallId !== toolCallId) continue;
+      pendingApprovals.delete(relayEventId);
+      const decision = decisionFromSelectedOption(
+        typeof payload.selectedOption === 'string' ? payload.selectedOption : undefined,
+      );
+      void resolveApprovalOnRelay(config, relayEventId, decision);
+      break;
+    }
   }
   // everything else (turn markers, metadata, tool_result, steering) is noise here
+}
+
+function decisionFromSelectedOption(optionId: string | undefined): 'approve' | 'deny' | 'approve_always' {
+  switch (optionId) {
+    case 'always-accept':
+      return 'approve_always';
+    case 'reject':
+    case 'always-reject':
+      return 'deny';
+    default:
+      return 'approve';
+  }
 }
 
 function markDelivered(sessionId: string, text: string): void {
@@ -595,16 +791,44 @@ async function pushError(config: BridgeConfig, sessionId: string, text: string):
   await push(config, { type: 'error', text, sessionId });
 }
 
-async function push(config: BridgeConfig, payload: Record<string, unknown>): Promise<void> {
+/** Returns the relay-assigned id of the created event, or undefined if the push failed. */
+async function push(config: BridgeConfig, payload: Record<string, unknown>): Promise<string | undefined> {
   try {
     const url = new URL('/api/agent/push', config.relayUrl);
-    await fetch(url, {
+    const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.agentSecret}` },
       body: JSON.stringify(payload),
     });
+    if (!res.ok) throw new Error(`push ${res.status}`);
+    const body = (await res.json()) as { event?: { id?: string } };
+    return body.event?.id;
   } catch (err) {
     log(`Push failed: ${describeError(err)}`);
+    return undefined;
+  }
+}
+
+/**
+ * Tells the relay an approval_request has been resolved, without going
+ * through the phone's owner-session route — used when the developer
+ * answered a prompt directly in the IDE.
+ */
+async function resolveApprovalOnRelay(
+  config: BridgeConfig,
+  relayEventId: string,
+  decision: 'approve' | 'deny' | 'approve_always',
+): Promise<void> {
+  try {
+    const url = new URL('/api/agent/approvals/resolve', config.relayUrl);
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.agentSecret}` },
+      body: JSON.stringify({ requestId: relayEventId, decision }),
+    });
+    if (!res.ok) throw new Error(`resolve ${res.status}`);
+  } catch (err) {
+    log(`Resolve approval failed: ${describeError(err)}`);
   }
 }
 

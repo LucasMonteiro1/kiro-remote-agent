@@ -21,6 +21,13 @@ export interface SessionMessage {
   type: string;
   timestamp: string;
   text: string;
+  /**
+   * Only present for `type: "assistant"`. Kiro tags the model's internal
+   * reasoning as `"Reasoning"` and the reply meant to be read as `"Say"`;
+   * both are written as `assistant` entries, so this is the only thing that
+   * distinguishes a thought from an answer in a transcript.
+   */
+  operationType?: string;
 }
 
 /**
@@ -197,8 +204,16 @@ function parseMessageLine(line: string): SessionMessage | null {
   switch (type) {
     case 'user':
       return { type, timestamp, text: String(payload.content ?? '') };
-    case 'assistant':
-      return { type, timestamp, text: String(payload.content ?? '') };
+    case 'assistant': {
+      const operationType =
+        typeof payload.operationType === 'string' ? payload.operationType : undefined;
+      return {
+        type,
+        timestamp,
+        text: String(payload.content ?? ''),
+        ...(operationType ? { operationType } : {}),
+      };
+    }
     case 'tool_call': {
       const toolName = String(payload.toolName ?? payload.actionType ?? 'tool');
       const title = payload.title ? String(payload.title) : toolName;
