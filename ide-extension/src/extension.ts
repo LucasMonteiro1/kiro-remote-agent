@@ -1,5 +1,14 @@
 import * as vscode from 'vscode';
-import { readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'fs';
+import {
+  closeSync,
+  openSync,
+  readFileSync,
+  readSync,
+  readdirSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 
@@ -23,6 +32,17 @@ import { join } from 'path';
 
 const KIRO_SESSIONS_DIR = join(homedir(), '.kiro', 'sessions');
 const HOST_LABEL = 'kiro-ide';
+/** Sentinel sessionId meaning "create a brand new IDE session for this prompt". */
+const NEW_SESSION_SENTINEL = '__new__';
+const WATCH_INTERVAL_MS = 2000;
+/** How often to look for sessions in this window that should be streamed. */
+const DISCOVER_INTERVAL_MS = 10000;
+/** Only stream sessions touched this recently — old history isn't interesting. */
+const RECENT_WINDOW_MS = 24 * 60 * 60 * 1000;
+/** Upper bound on concurrently streamed sessions, most recently active first. */
+const MAX_WATCHED_SESSIONS = 12;
+/** Window for matching a file entry against a message we just delivered. */
+const ECHO_WINDOW_MS = 90 * 1000;
 
 let output: vscode.OutputChannel;
 let pollTimer: NodeJS.Timeout | undefined;
@@ -55,6 +75,7 @@ export function activate(context: vscode.ExtensionContext): void {
         `Secret: ${agentSecret ? 'set' : '(not set)'}`,
         `Workspace: ${currentWorkspacePaths().join(', ') || '(none)'}`,
         `Delivered this session: ${deliveredCount}`,
+        `Streaming sessions: ${watchers.size}`,
         `Last error: ${lastPollError ?? 'none'}`,
       ];
       vscode.window.showInformationMessage(parts.join(' · '), 'Show Log').then((choice) => {
@@ -74,6 +95,25 @@ export function activate(context: vscode.ExtensionContext): void {
 
   void maybeRunSelfTest();
   restartPolling(context);
+}
+
+let discoverTimer: NodeJS.Timeout | undefined;
+
+/**
+ * Keeps streaming in sync with the window on a timer, so sessions you drive
+ * directly in the IDE reach the phone without being started from the web.
+ */
+function startDiscovery(): void {
+  if (discoverTimer) clearInterval(discoverTimer);
+  discoverTimer = setInterval(() => {
+    const config = readConfig();
+    if (!config.enabled || !config.relayUrl || !config.agentSecret) return;
+    try {
+      ensureWatchers(config);
+    } catch (err) {
+      log(`Discovery failed: ${describeError(err)}`);
+    }
+  }, DISCOVER_INTERVAL_MS);
 }
 
 /**
@@ -132,6 +172,9 @@ async function maybeRunSelfTest(): Promise<void> {
 
 export function deactivate(): void {
   if (pollTimer) clearTimeout(pollTimer);
+  if (discoverTimer) clearInterval(discoverTimer);
+  for (const watcher of watchers.values()) clearInterval(watcher.timer);
+  watchers.clear();
 }
 
 function restartPolling(context: vscode.ExtensionContext): void {
@@ -146,6 +189,12 @@ function restartPolling(context: vscode.ExtensionContext): void {
     return;
   }
   log(`Polling ${relayUrl} for workspace [${currentWorkspacePaths().join(', ')}]`);
+  try {
+    ensureWatchers(readConfig());
+  } catch (err) {
+    log(`Initial discovery failed: ${describeError(err)}`);
+  }
+  startDiscovery();
   void pollLoop(context);
 }
 
@@ -183,7 +232,12 @@ async function handleRemoteMessage(
   text: string,
   eventId: string,
 ): Promise<void> {
-  if (!sessionBelongsToThisWindow(sessionId)) return;
+  const isNew = sessionId === NEW_SESSION_SENTINEL;
+
+  // A "create a new session" request isn't tied to a workspace yet, so any
+  // window could serve it; the claim below decides which one does. For an
+  // existing session, only the window that owns its workspace handles it.
+  if (!isNew && !sessionBelongsToThisWindow(sessionId)) return;
 
   const claimed = await claim(config.relayUrl, config.agentSecret, eventId);
   if (!claimed) {
@@ -192,18 +246,269 @@ async function handleRemoteMessage(
   }
 
   try {
+    let targetSessionId = sessionId;
+
+    if (isNew) {
+      const created = (await vscode.commands.executeCommand('kiroAgent.sessions.create')) as
+        | { sessionId?: string }
+        | undefined;
+      if (!created?.sessionId) throw new Error('o IDE não retornou o id da nova sessão');
+      targetSessionId = created.sessionId;
+      log(`Created new session ${shortId(targetSessionId)}`);
+      // Tell the phone which session was created so it can open that thread.
+      await push(config, {
+        type: 'status',
+        text: `session:${targetSessionId}`,
+        sessionId: NEW_SESSION_SENTINEL,
+      });
+    }
+
     // Make sure the session is the one loaded in the chat panel; prompting a
     // session the window hasn't loaded yet fails, and this also means you
     // see the reply land live if you're looking at the IDE.
-    await vscode.commands.executeCommand('kiroAgent.viewSession', sessionId);
-    await vscode.commands.executeCommand('kiroAgent.sessions.sendPrompt', sessionId, text);
+    await vscode.commands.executeCommand('kiroAgent.viewSession', targetSessionId);
+
+    // Start watching before prompting so no part of the answer is missed.
+    watchSessionForReplies(config, targetSessionId);
+
+    markDelivered(targetSessionId, text);
+    await vscode.commands.executeCommand('kiroAgent.sessions.sendPrompt', targetSessionId, text);
     deliveredCount += 1;
-    log(`Delivered to ${shortId(sessionId)}: ${text.slice(0, 80)}`);
-    await pushStatus(config, sessionId, 'Mensagem entregue na sessão do Kiro IDE.');
+    log(`Delivered to ${shortId(targetSessionId)}: ${text.slice(0, 80)}`);
   } catch (err) {
     const message = describeError(err);
     log(`Failed to deliver to ${shortId(sessionId)}: ${message}`);
     await pushError(config, sessionId, `Falha ao entregar no Kiro IDE: ${message}`);
+  }
+}
+
+// --- streaming the IDE's answer back to the phone ---
+
+interface SessionWatcher {
+  timer: NodeJS.Timeout;
+  offset: number;
+}
+
+const watchers = new Map<string, SessionWatcher>();
+/** Messages this window delivered, so the file echo of them isn't re-sent. */
+const recentlyDelivered: { sessionId: string; text: string; at: number }[] = [];
+
+/**
+ * Keeps the set of streamed sessions in sync with what's actually active in
+ * this window: every session of this workspace touched in the last day, most
+ * recent first, capped so we don't tail hundreds of old files.
+ *
+ * This runs on a timer rather than only when the phone sends something, so a
+ * session you started and are driving inside the IDE also streams to the
+ * phone without you having to touch the web first.
+ */
+function ensureWatchers(config: BridgeConfig): void {
+  const candidates = recentSessionsForThisWindow().slice(0, MAX_WATCHED_SESSIONS);
+  const wanted = new Set(candidates.map((candidate) => candidate.sessionId));
+
+  for (const [sessionId, watcher] of watchers) {
+    if (!wanted.has(sessionId)) {
+      clearInterval(watcher.timer);
+      watchers.delete(sessionId);
+      log(`Stopped watching ${shortId(sessionId)} (no longer recent).`);
+    }
+  }
+
+  for (const candidate of candidates) {
+    watchSessionForReplies(config, candidate.sessionId);
+  }
+}
+
+/**
+ * Streams a session's turns back to the phone.
+ *
+ * The IDE appends every turn to the session's own messages.jsonl, so we tail
+ * that file from wherever it currently ends and forward new entries to the
+ * relay as normal events. The phone already polls the event log, so this
+ * works without depending on the daemon reading transcripts.
+ */
+function watchSessionForReplies(config: BridgeConfig, sessionId: string): void {
+  if (watchers.has(sessionId)) return;
+
+  const sessionDir = findSessionDir(sessionId);
+  if (!sessionDir) {
+    log(`Cannot watch ${shortId(sessionId)}: session directory not found.`);
+    return;
+  }
+  const messagesPath = join(sessionDir, 'messages.jsonl');
+
+  const watcher: SessionWatcher = {
+    offset: fileSize(messagesPath), // only forward what comes after this point
+    timer: setInterval(() => {
+      try {
+        tickWatcher(config, sessionId, messagesPath);
+      } catch (err) {
+        log(`Watcher error for ${shortId(sessionId)}: ${describeError(err)}`);
+      }
+    }, WATCH_INTERVAL_MS),
+  };
+
+  watchers.set(sessionId, watcher);
+  log(`Watching ${shortId(sessionId)} (from byte ${watcher.offset}).`);
+}
+
+function tickWatcher(config: BridgeConfig, sessionId: string, messagesPath: string): void {
+  const watcher = watchers.get(sessionId);
+  if (!watcher) return;
+
+  const size = fileSize(messagesPath);
+  if (size < watcher.offset) {
+    watcher.offset = size; // file was rewritten/truncated; resync
+    return;
+  }
+  if (size === watcher.offset) return;
+
+  const chunk = readFrom(messagesPath, watcher.offset, size);
+  // Only advance past whole lines, so a half-written line is re-read next tick.
+  const lastNewline = chunk.lastIndexOf('\n');
+  if (lastNewline < 0) return;
+
+  watcher.offset += Buffer.byteLength(chunk.slice(0, lastNewline + 1), 'utf8');
+  for (const line of chunk.slice(0, lastNewline).split('\n')) {
+    forwardLine(config, sessionId, line);
+  }
+}
+
+/** Turns one messages.jsonl line into a relay event, skipping bookkeeping entries. */
+function forwardLine(config: BridgeConfig, sessionId: string, line: string): void {
+  if (!line.trim()) return;
+  let payload: Record<string, unknown> | undefined;
+  try {
+    payload = (JSON.parse(line) as { payload?: Record<string, unknown> }).payload;
+  } catch {
+    return;
+  }
+  if (!payload) return;
+
+  const type = String(payload.type ?? '');
+
+  if (type === 'user') {
+    const text = String(payload.content ?? '').trim();
+    // A message sent from the phone is already in the event log; the IDE
+    // writing it to the file would otherwise show up as a second bubble.
+    if (text && !wasJustDelivered(sessionId, text)) {
+      void push(config, { type: 'user_message', text, sessionId });
+    }
+    return;
+  }
+
+  if (type === 'assistant') {
+    const text = String(payload.content ?? '').trim();
+    if (text) void push(config, { type: 'assistant_message', text, sessionId });
+    return;
+  }
+
+  if (type === 'tool_call') {
+    const label = String(payload.title ?? payload.toolName ?? 'tool');
+    void push(config, { type: 'status', text: `● ${label}`.slice(0, 490), sessionId });
+  }
+  // everything else (turn markers, metadata, tool_result, steering) is noise here
+}
+
+function markDelivered(sessionId: string, text: string): void {
+  const now = Date.now();
+  recentlyDelivered.push({ sessionId, text: text.trim(), at: now });
+  while (recentlyDelivered.length > 0 && now - recentlyDelivered[0]!.at > ECHO_WINDOW_MS) {
+    recentlyDelivered.shift();
+  }
+}
+
+function wasJustDelivered(sessionId: string, text: string): boolean {
+  const now = Date.now();
+  return recentlyDelivered.some(
+    (entry) =>
+      entry.sessionId === sessionId && entry.text === text.trim() && now - entry.at <= ECHO_WINDOW_MS,
+  );
+}
+
+/**
+ * Sessions of this window's workspace that were modified recently, newest
+ * first. Reads only session.json metadata, never the transcripts.
+ */
+function recentSessionsForThisWindow(): { sessionId: string; modifiedAt: number }[] {
+  const ourPaths = currentWorkspacePaths();
+  if (ourPaths.length === 0) return [];
+
+  const found: { sessionId: string; modifiedAt: number }[] = [];
+  const cutoff = Date.now() - RECENT_WINDOW_MS;
+
+  let workspaceDirs: string[];
+  try {
+    workspaceDirs = readdirSync(KIRO_SESSIONS_DIR);
+  } catch {
+    return [];
+  }
+
+  for (const workspaceDir of workspaceDirs) {
+    const workspacePath = join(KIRO_SESSIONS_DIR, workspaceDir);
+    let sessionDirs: string[];
+    try {
+      if (!statSync(workspacePath).isDirectory()) continue;
+      sessionDirs = readdirSync(workspacePath);
+    } catch {
+      continue;
+    }
+
+    for (const sessionId of sessionDirs) {
+      const messagesPath = join(workspacePath, sessionId, 'messages.jsonl');
+      let modifiedAt: number;
+      try {
+        modifiedAt = statSync(messagesPath).mtimeMs;
+      } catch {
+        continue; // no transcript yet, nothing to stream
+      }
+      if (modifiedAt < cutoff) continue;
+
+      const sessionPaths = readSessionWorkspacePaths(sessionId);
+      if (!sessionPaths || !sameWorkspace(sessionPaths, ourPaths)) continue;
+      found.push({ sessionId, modifiedAt });
+    }
+  }
+
+  return found.sort((a, b) => b.modifiedAt - a.modifiedAt);
+}
+
+function findSessionDir(sessionId: string): string | null {
+  let workspaceDirs: string[];
+  try {
+    workspaceDirs = readdirSync(KIRO_SESSIONS_DIR);
+  } catch {
+    return null;
+  }
+  for (const workspaceDir of workspaceDirs) {
+    const candidate = join(KIRO_SESSIONS_DIR, workspaceDir, sessionId);
+    try {
+      if (statSync(join(candidate, 'session.json')).isFile()) return candidate;
+    } catch {
+      // keep looking
+    }
+  }
+  return null;
+}
+
+function fileSize(path: string): number {
+  try {
+    return statSync(path).size;
+  } catch {
+    return 0;
+  }
+}
+
+function readFrom(path: string, start: number, end: number): string {
+  const length = end - start;
+  if (length <= 0) return '';
+  const buffer = Buffer.alloc(length);
+  const fd = openSync(path, 'r');
+  try {
+    const read = readSync(fd, buffer, 0, length, start);
+    return buffer.subarray(0, read).toString('utf8');
+  } finally {
+    closeSync(fd);
   }
 }
 
@@ -215,7 +520,10 @@ async function handleRemoteMessage(
 function sessionBelongsToThisWindow(sessionId: string): boolean {
   const sessionPaths = readSessionWorkspacePaths(sessionId);
   if (!sessionPaths) return false;
-  const ourPaths = currentWorkspacePaths();
+  return sameWorkspace(sessionPaths, currentWorkspacePaths());
+}
+
+function sameWorkspace(sessionPaths: string[], ourPaths: string[]): boolean {
   if (sessionPaths.length === 0 || ourPaths.length === 0) return false;
   return (
     sessionPaths.every((path) => ourPaths.includes(path)) &&
