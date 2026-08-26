@@ -36,8 +36,8 @@
         },
         "kiroRemoteBridge.pollIntervalMs": {
           "type": "number",
-          "default": 4000,
-          "description": "How often (ms) to poll the relay for new remote messages."
+          "default": 15000,
+          "description": "How often (ms) to poll the relay for new remote messages. Every poll spends Redis commands on the relay (Upstash free tier caps at 500K/month), and this runs per open IDE window, so keep this in step with kiro-remote-agent's POLL_INTERVAL_MS rather than lowering it alone."
         }
       }
     },
