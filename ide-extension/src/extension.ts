@@ -546,6 +546,8 @@ function forwardLine(config: BridgeConfig, sessionId: string, line: string): voi
   if (type === 'tool_call') {
     const title = String(payload.title ?? payload.toolName ?? 'tool');
     const toolName = payload.toolName ? String(payload.toolName) : undefined;
+    const kind = typeof payload.kind === 'string' ? payload.kind : undefined;
+    const files = extractFileBasenames(payload.args);
     // Kept so a later pending_interaction (which only carries the same
     // toolCallId, not a human-readable title) can show what's being approved.
     const toolCallId = typeof payload.toolCallId === 'string' ? payload.toolCallId : undefined;
@@ -554,6 +556,8 @@ function forwardLine(config: BridgeConfig, sessionId: string, line: string): voi
       type: 'tool_call',
       title: title.slice(0, 490),
       ...(toolName ? { toolName: toolName.slice(0, 200) } : {}),
+      ...(kind ? { kind } : {}),
+      ...(files.length > 0 ? { files } : {}),
       sessionId,
     });
     return;
@@ -592,6 +596,34 @@ function forwardLine(config: BridgeConfig, sessionId: string, line: string): voi
     }
   }
   // everything else (turn markers, metadata, tool_result, steering) is noise here
+}
+
+/**
+ * Pulls file basenames out of a tool_call's args, the way the IDE tags a
+ * "Read Files"/"Read File" row with small file-name chips. Only looks at
+ * the arg shapes actually used by file-oriented tools (`path`, `paths`,
+ * `filePath`, `targetFile`) — anything else (grep queries, shell commands)
+ * has no natural "file" to show and is left without badges.
+ */
+function extractFileBasenames(args: unknown): string[] {
+  if (!args || typeof args !== 'object') return [];
+  const record = args as Record<string, unknown>;
+  const candidates: unknown[] = [
+    record.path,
+    record.filePath,
+    record.targetFile,
+    record.sourcePath,
+    record.destinationPath,
+    ...(Array.isArray(record.paths) ? record.paths : []),
+  ];
+
+  const basenames: string[] = [];
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string' || candidate.length === 0) continue;
+    const basename = candidate.split(/[/\\]/).pop();
+    if (basename) basenames.push(basename);
+  }
+  return basenames.slice(0, 8);
 }
 
 function decisionFromSelectedOption(optionId: string | undefined): 'approve' | 'deny' | 'approve_always' {

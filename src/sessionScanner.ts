@@ -28,6 +28,10 @@ export interface SessionMessage {
    * distinguishes a thought from an answer in a transcript.
    */
   operationType?: string;
+  /** Only present for `type: "tool_call"`: e.g. "search", "read", "execute". */
+  kind?: string;
+  /** Only present for `type: "tool_call"`: basenames of files it targeted. */
+  files?: string[];
 }
 
 /**
@@ -217,7 +221,15 @@ function parseMessageLine(line: string): SessionMessage | null {
     case 'tool_call': {
       const toolName = String(payload.toolName ?? payload.actionType ?? 'tool');
       const title = payload.title ? String(payload.title) : toolName;
-      return { type, timestamp, text: title };
+      const kind = typeof payload.kind === 'string' ? payload.kind : undefined;
+      const files = extractFileBasenames(payload.args);
+      return {
+        type,
+        timestamp,
+        text: title,
+        ...(kind ? { kind } : {}),
+        ...(files.length > 0 ? { files } : {}),
+      };
     }
     case 'tool_result': {
       // tool_result content can be large (file contents, search results);
@@ -232,4 +244,32 @@ function parseMessageLine(line: string): SessionMessage | null {
 
 function truncate(text: string, maxLength: number): string {
   return text.length > maxLength ? `${text.slice(0, maxLength)}…` : text;
+}
+
+/**
+ * Pulls file basenames out of a tool_call's args, the way the IDE tags a
+ * "Read Files"/"Read File" row with small file-name chips. Only looks at
+ * the arg shapes actually used by file-oriented tools (`path`, `paths`,
+ * `filePath`, `targetFile`) — anything else (grep queries, shell commands)
+ * has no natural "file" to show and is left without badges.
+ */
+function extractFileBasenames(args: unknown): string[] {
+  if (!args || typeof args !== 'object') return [];
+  const record = args as Record<string, unknown>;
+  const candidates: unknown[] = [
+    record.path,
+    record.filePath,
+    record.targetFile,
+    record.sourcePath,
+    record.destinationPath,
+    ...(Array.isArray(record.paths) ? record.paths : []),
+  ];
+
+  const basenames: string[] = [];
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string' || candidate.length === 0) continue;
+    const basename = candidate.split(/[/\\]/).pop();
+    if (basename) basenames.push(basename);
+  }
+  return basenames.slice(0, 8);
 }
