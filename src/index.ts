@@ -4,6 +4,23 @@ import { RelayClient } from './relayClient';
 import { KiroSession } from './kiroSession';
 import { scanSessionSummaries, readSessionTranscript } from './sessionScanner';
 
+// If every poll loop is failing (typically a stuck undici keep-alive
+// connection pool after the laptop sleeps or the network changes — fetch
+// never recovers on its own in that case), give up and let launchd/pm2
+// restart the process instead of retrying forever into a dead pool.
+const MAX_CONSECUTIVE_FAILURES = 10;
+let consecutiveFailures = 0;
+
+function noteLoopResult(ok: boolean): void {
+  consecutiveFailures = ok ? 0 : consecutiveFailures + 1;
+  if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+    console.error(
+      `[kiro-remote-agent] ${consecutiveFailures} consecutive relay failures, restarting process.`,
+    );
+    process.exit(1);
+  }
+}
+
 async function main() {
   const config = loadConfig();
   const relay = new RelayClient(config);
@@ -55,8 +72,10 @@ async function main() {
           }
         }
       }
+      noteLoopResult(true);
     } catch (err) {
       logError('poll loop', err);
+      noteLoopResult(false);
     } finally {
       setTimeout(pollLoop, config.POLL_INTERVAL_MS);
     }
@@ -71,8 +90,10 @@ async function main() {
     try {
       const summaries = scanSessionSummaries();
       await relay.pushLocalSessions(summaries);
+      noteLoopResult(true);
     } catch (err) {
       logError('session scan loop', err);
+      noteLoopResult(false);
     } finally {
       setTimeout(sessionScanLoop, config.SESSION_SCAN_INTERVAL_MS);
     }
@@ -82,9 +103,13 @@ async function main() {
     try {
       const requests = await relay.pullSessionDetailRequests(sessionDetailCursor);
       for (const req of requests) {
-        sessionDetailCursor = Math.max(sessionDetailCursor, req.createdAt);
         const detail = readSessionTranscript(req.sessionId);
         if (detail) {
+          // Only advance the cursor once the result is actually delivered.
+          // If pushSessionDetailResult throws (network hiccup), stop here
+          // and leave the cursor behind so this request (and everything
+          // still unprocessed after it) gets retried on the next poll,
+          // instead of being silently skipped forever.
           await relay.pushSessionDetailResult(
             req.id,
             req.sessionId,
@@ -94,9 +119,14 @@ async function main() {
             detail.truncated,
           );
         }
+        // Nothing to retry for this one (either delivered, or the session
+        // dir genuinely doesn't exist on disk) — safe to move past it.
+        sessionDetailCursor = Math.max(sessionDetailCursor, req.createdAt);
       }
+      noteLoopResult(true);
     } catch (err) {
       logError('session detail loop', err);
+      noteLoopResult(false);
     } finally {
       setTimeout(sessionDetailLoop, config.POLL_INTERVAL_MS);
     }

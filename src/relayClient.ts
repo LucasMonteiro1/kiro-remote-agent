@@ -1,6 +1,29 @@
 import type { AgentConfig } from './config';
 import type { SessionMessage, SessionSummary } from './sessionScanner';
 
+// Guards against a wedged TCP socket (typical after the laptop sleeps or
+// switches networks): without this, a dead connection can leave `fetch`
+// pending forever — neither resolving nor rejecting — which stalls the
+// polling loop's `finally` block and stops it from ever scheduling its
+// next attempt. An explicit timeout guarantees every call eventually
+// settles one way or another.
+const FETCH_TIMEOUT_MS = 15000;
+
+async function fetchWithTimeout(url: string | URL, init?: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    if (controller.signal.aborted) {
+      throw new Error(`Request timed out after ${FETCH_TIMEOUT_MS}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export type RelayEvent =
   | { id: string; type: 'user_message'; text: string; createdAt: number; sessionId?: string }
   | {
@@ -25,7 +48,7 @@ export class RelayClient {
     url.searchParams.set('since', String(this.cursor));
     url.searchParams.set('host', this.config.HOST_LABEL);
 
-    const res = await fetch(url, {
+    const res = await fetchWithTimeout(url, {
       headers: { Authorization: `Bearer ${this.config.AGENT_SHARED_SECRET}` },
     });
 
@@ -61,7 +84,7 @@ export class RelayClient {
   /** Overwrites the relay's snapshot of local Kiro IDE sessions. */
   async pushLocalSessions(sessions: SessionSummary[]): Promise<void> {
     const url = new URL('/api/agent/local-sessions', this.config.RELAY_URL);
-    const res = await fetch(url, {
+    const res = await fetchWithTimeout(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -82,7 +105,7 @@ export class RelayClient {
     const url = new URL('/api/agent/session-detail-requests', this.config.RELAY_URL);
     url.searchParams.set('since', String(sinceMs));
 
-    const res = await fetch(url, {
+    const res = await fetchWithTimeout(url, {
       headers: { Authorization: `Bearer ${this.config.AGENT_SHARED_SECRET}` },
     });
 
@@ -106,7 +129,7 @@ export class RelayClient {
     truncated: boolean,
   ): Promise<void> {
     const url = new URL('/api/agent/session-detail-result', this.config.RELAY_URL);
-    const res = await fetch(url, {
+    const res = await fetchWithTimeout(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -128,7 +151,7 @@ export class RelayClient {
       | { type: 'approval_request'; promptText: string; toolName?: string; sessionId?: string },
   ): Promise<{ id: string }> {
     const url = new URL('/api/agent/push', this.config.RELAY_URL);
-    const res = await fetch(url, {
+    const res = await fetchWithTimeout(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
