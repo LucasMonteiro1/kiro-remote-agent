@@ -43,6 +43,8 @@ const RECENT_WINDOW_MS = 24 * 60 * 60 * 1000;
 const MAX_WATCHED_SESSIONS = 12;
 /** Window for matching a file entry against a message we just delivered. */
 const ECHO_WINDOW_MS = 90 * 1000;
+/** Delay after sendPrompt before re-issuing viewSession, to work around the user's own bubble not appearing (see handleRemoteMessage). */
+const VIEW_REFRESH_DELAY_MS = 400;
 /** How long to wait for the IDE to confirm a dispatched approval decision actually resolved the tool call. */
 const APPROVAL_CONFIRM_TIMEOUT_MS = 6000;
 
@@ -285,6 +287,20 @@ async function handleRemoteMessage(
     await vscode.commands.executeCommand('kiroAgent.sessions.sendPrompt', targetSessionId, text);
     deliveredCount += 1;
     log(`Delivered to ${shortId(targetSessionId)}: ${text.slice(0, 80)}`);
+
+    // sendPrompt only submits the turn through the ACP client — it doesn't
+    // trigger the webview's "optimistic append" that draws the user's own
+    // bubble (that only fires from the textbox's own submit handler, see
+    // REMOTE_HOST_CAPABILITIES.optimisticUserPromptAppend in Kiro's own
+    // extension). The prompt is written to messages.jsonl for real, so a
+    // fresh viewSession call — which reloads the sidebar panel's transcript
+    // from disk — is enough to make the bubble show up without a full IDE
+    // reload. A short delay lets the write land on disk first.
+    setTimeout(() => {
+      void vscode.commands.executeCommand('kiroAgent.viewSession', targetSessionId).then(undefined, (err) => {
+        log(`Failed to refresh session view for ${shortId(targetSessionId)}: ${describeError(err)}`);
+      });
+    }, VIEW_REFRESH_DELAY_MS);
   } catch (err) {
     const message = describeError(err);
     log(`Failed to deliver to ${shortId(sessionId)}: ${message}`);

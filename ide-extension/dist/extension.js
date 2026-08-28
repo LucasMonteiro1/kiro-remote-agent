@@ -69,6 +69,8 @@ const RECENT_WINDOW_MS = 24 * 60 * 60 * 1000;
 const MAX_WATCHED_SESSIONS = 12;
 /** Window for matching a file entry against a message we just delivered. */
 const ECHO_WINDOW_MS = 90 * 1000;
+/** Delay after sendPrompt before re-issuing viewSession, to work around the user's own bubble not appearing (see handleRemoteMessage). */
+const VIEW_REFRESH_DELAY_MS = 400;
 /** How long to wait for the IDE to confirm a dispatched approval decision actually resolved the tool call. */
 const APPROVAL_CONFIRM_TIMEOUT_MS = 6000;
 let output;
@@ -274,6 +276,19 @@ async function handleRemoteMessage(config, sessionId, text, eventId) {
         await vscode.commands.executeCommand('kiroAgent.sessions.sendPrompt', targetSessionId, text);
         deliveredCount += 1;
         log(`Delivered to ${shortId(targetSessionId)}: ${text.slice(0, 80)}`);
+        // sendPrompt only submits the turn through the ACP client — it doesn't
+        // trigger the webview's "optimistic append" that draws the user's own
+        // bubble (that only fires from the textbox's own submit handler, see
+        // REMOTE_HOST_CAPABILITIES.optimisticUserPromptAppend in Kiro's own
+        // extension). The prompt is written to messages.jsonl for real, so a
+        // fresh viewSession call — which reloads the sidebar panel's transcript
+        // from disk — is enough to make the bubble show up without a full IDE
+        // reload. A short delay lets the write land on disk first.
+        setTimeout(() => {
+            void vscode.commands.executeCommand('kiroAgent.viewSession', targetSessionId).then(undefined, (err) => {
+                log(`Failed to refresh session view for ${shortId(targetSessionId)}: ${describeError(err)}`);
+            });
+        }, VIEW_REFRESH_DELAY_MS);
     }
     catch (err) {
         const message = describeError(err);
@@ -500,6 +515,8 @@ function forwardLine(config, sessionId, line) {
     if (type === 'tool_call') {
         const title = String(payload.title ?? payload.toolName ?? 'tool');
         const toolName = payload.toolName ? String(payload.toolName) : undefined;
+        const kind = typeof payload.kind === 'string' ? payload.kind : undefined;
+        const files = extractFileBasenames(payload.args);
         // Kept so a later pending_interaction (which only carries the same
         // toolCallId, not a human-readable title) can show what's being approved.
         const toolCallId = typeof payload.toolCallId === 'string' ? payload.toolCallId : undefined;
@@ -509,6 +526,8 @@ function forwardLine(config, sessionId, line) {
             type: 'tool_call',
             title: title.slice(0, 490),
             ...(toolName ? { toolName: toolName.slice(0, 200) } : {}),
+            ...(kind ? { kind } : {}),
+            ...(files.length > 0 ? { files } : {}),
             sessionId,
         });
         return;
@@ -547,6 +566,35 @@ function forwardLine(config, sessionId, line) {
         }
     }
     // everything else (turn markers, metadata, tool_result, steering) is noise here
+}
+/**
+ * Pulls file basenames out of a tool_call's args, the way the IDE tags a
+ * "Read Files"/"Read File" row with small file-name chips. Only looks at
+ * the arg shapes actually used by file-oriented tools (`path`, `paths`,
+ * `filePath`, `targetFile`) — anything else (grep queries, shell commands)
+ * has no natural "file" to show and is left without badges.
+ */
+function extractFileBasenames(args) {
+    if (!args || typeof args !== 'object')
+        return [];
+    const record = args;
+    const candidates = [
+        record.path,
+        record.filePath,
+        record.targetFile,
+        record.sourcePath,
+        record.destinationPath,
+        ...(Array.isArray(record.paths) ? record.paths : []),
+    ];
+    const basenames = [];
+    for (const candidate of candidates) {
+        if (typeof candidate !== 'string' || candidate.length === 0)
+            continue;
+        const basename = candidate.split(/[/\\]/).pop();
+        if (basename)
+            basenames.push(basename);
+    }
+    return basenames.slice(0, 8);
 }
 function decisionFromSelectedOption(optionId) {
     switch (optionId) {
