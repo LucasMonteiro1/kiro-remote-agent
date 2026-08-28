@@ -43,6 +43,8 @@ export interface SessionMessage {
   kind?: string;
   /** Only present for `type: "tool_call"`: basenames of files it targeted. */
   files?: string[];
+  /** Only present for `type: "tool_call"`: compact summary of its args (command, query, etc). */
+  detail?: string;
 }
 
 /**
@@ -254,12 +256,14 @@ function parseMessageLine(line: string): SessionMessage | null {
       const title = payload.title ? String(payload.title) : toolName;
       const kind = typeof payload.kind === 'string' ? payload.kind : undefined;
       const files = extractFileBasenames(payload.args);
+      const detail = summarizeToolArgs(payload.args);
       return {
         type,
         timestamp,
         text: title,
         ...(kind ? { kind } : {}),
         ...(files.length > 0 ? { files } : {}),
+        ...(detail ? { detail } : {}),
       };
     }
     case 'tool_result': {
@@ -275,6 +279,52 @@ function parseMessageLine(line: string): SessionMessage | null {
 
 function truncate(text: string, maxLength: number): string {
   return text.length > maxLength ? `${text.slice(0, maxLength)}…` : text;
+}
+
+const MAX_DETAIL_LENGTH = 300;
+// Argument keys worth surfacing as a tool's "detail" line, in priority
+// order — the first one present wins. Covers the common tool shapes: shell
+// commands, search queries/patterns, and generic file targets. Deliberately
+// excludes anything that can carry large payloads (file contents, diffs,
+// text to write) so `detail` always stays a short, cheap-to-store string.
+const DETAIL_ARG_KEYS = [
+  'command',
+  'query',
+  'regex',
+  'pattern',
+  'url',
+  'path',
+  'filePath',
+  'targetFile',
+];
+
+/**
+ * Builds a compact one-line summary of a tool_call's args — the shell
+ * command run, the search query used, the URL fetched, etc. — the way the
+ * IDE reveals a tool's detail when you expand its row in a "Running N
+ * tools" group. Only pulls from a short allow-list of scalar arg keys, so
+ * this can't accidentally include a large payload (file contents a
+ * fs_write call was about to write, a big diff, etc).
+ */
+function summarizeToolArgs(args: unknown): string | undefined {
+  if (!args || typeof args !== 'object') return undefined;
+  const record = args as Record<string, unknown>;
+
+  for (const key of DETAIL_ARG_KEYS) {
+    const value = record[key];
+    if (typeof value === 'string' && value.length > 0) {
+      return truncate(value, MAX_DETAIL_LENGTH);
+    }
+  }
+
+  // Multi-file tools (read_files, etc) carry a `paths` array instead of a
+  // single `path` — join a few of them so the detail still says something.
+  if (Array.isArray(record.paths) && record.paths.length > 0) {
+    const joined = record.paths.filter((p) => typeof p === 'string').join(', ');
+    if (joined) return truncate(joined, MAX_DETAIL_LENGTH);
+  }
+
+  return undefined;
 }
 
 /**
