@@ -517,6 +517,7 @@ function forwardLine(config, sessionId, line) {
         const toolName = payload.toolName ? String(payload.toolName) : undefined;
         const kind = typeof payload.kind === 'string' ? payload.kind : undefined;
         const files = extractFileBasenames(payload.args);
+        const detail = summarizeToolArgs(payload.args);
         // Kept so a later pending_interaction (which only carries the same
         // toolCallId, not a human-readable title) can show what's being approved.
         const toolCallId = typeof payload.toolCallId === 'string' ? payload.toolCallId : undefined;
@@ -528,6 +529,7 @@ function forwardLine(config, sessionId, line) {
             ...(toolName ? { toolName: toolName.slice(0, 200) } : {}),
             ...(kind ? { kind } : {}),
             ...(files.length > 0 ? { files } : {}),
+            ...(detail ? { detail } : {}),
             sessionId,
         });
         return;
@@ -566,6 +568,52 @@ function forwardLine(config, sessionId, line) {
         }
     }
     // everything else (turn markers, metadata, tool_result, steering) is noise here
+}
+const MAX_DETAIL_LENGTH = 300;
+// Argument keys worth surfacing as a tool's "detail" line, in priority
+// order — the first one present wins. Covers the common tool shapes: shell
+// commands, search queries/patterns, and generic file targets. Deliberately
+// excludes anything that can carry large payloads (file contents, diffs,
+// text to write) so `detail` always stays a short, cheap-to-send string —
+// this rides along on an event that's already being pushed, so it doesn't
+// add a new request, only a few dozen bytes to an existing one.
+const DETAIL_ARG_KEYS = [
+    'command',
+    'query',
+    'regex',
+    'pattern',
+    'url',
+    'path',
+    'filePath',
+    'targetFile',
+];
+/**
+ * Builds a compact one-line summary of a tool_call's args — the shell
+ * command run, the search query used, the URL fetched, etc. — the way the
+ * IDE reveals a tool's detail when you expand its row in a "Running N
+ * tools" group. Only pulls from a short allow-list of scalar arg keys, so
+ * this can't accidentally include a large payload (file contents a
+ * fs_write call was about to write, a big diff, etc).
+ */
+function summarizeToolArgs(args) {
+    if (!args || typeof args !== 'object')
+        return undefined;
+    const record = args;
+    for (const key of DETAIL_ARG_KEYS) {
+        const value = record[key];
+        if (typeof value === 'string' && value.length > 0) {
+            return truncateDetail(value);
+        }
+    }
+    if (Array.isArray(record.paths) && record.paths.length > 0) {
+        const joined = record.paths.filter((p) => typeof p === 'string').join(', ');
+        if (joined)
+            return truncateDetail(joined);
+    }
+    return undefined;
+}
+function truncateDetail(text) {
+    return text.length > MAX_DETAIL_LENGTH ? `${text.slice(0, MAX_DETAIL_LENGTH)}…` : text;
 }
 /**
  * Pulls file basenames out of a tool_call's args, the way the IDE tags a
