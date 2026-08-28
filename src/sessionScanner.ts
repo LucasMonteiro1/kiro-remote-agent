@@ -15,7 +15,7 @@ const MAX_TITLE_LENGTH = 200;
  * 20s while the sessions list is open), which is what was driving up
  * Vercel's Fast Origin Transfer usage.
  */
-const MAX_SYNCED_SESSIONS = 150;
+const MAX_SYNCED_SESSIONS = 50;
 
 export interface SessionSummary {
   id: string;
