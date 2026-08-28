@@ -101,7 +101,7 @@ export class RelayClient {
   /** Polls for pending "fetch this session's transcript" requests from the phone. */
   async pullSessionDetailRequests(
     sinceMs: number,
-  ): Promise<{ id: string; sessionId: string; createdAt: number }[]> {
+  ): Promise<{ id: string; sessionId: string; createdAt: number; sinceTimestamp?: string }[]> {
     const url = new URL('/api/agent/session-detail-requests', this.config.RELAY_URL);
     url.searchParams.set('since', String(sinceMs));
 
@@ -114,7 +114,7 @@ export class RelayClient {
     }
 
     const body = (await res.json()) as {
-      requests: { id: string; sessionId: string; createdAt: number }[];
+      requests: { id: string; sessionId: string; createdAt: number; sinceTimestamp?: string }[];
     };
     return body.requests;
   }

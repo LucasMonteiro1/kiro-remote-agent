@@ -109,8 +109,19 @@ export function scanSessionSummaries(): SessionSummary[] {
  * subdirectories, since we don't know which workspace it belongs to from
  * the id alone) and reads its messages.jsonl into a compact, renderable
  * list of chat entries.
+ *
+ * `sinceTimestamp` (an ISO timestamp) turns this into a tail read: only
+ * messages strictly after it are returned. The phone re-requests this on a
+ * timer while a session's chat screen is open (see SessionDetailView's
+ * TAIL_INTERVAL_MS), so without this filter every tail tick re-reads and
+ * re-uploads the whole transcript (up to MAX_MESSAGES_PER_SESSION entries,
+ * tens/hundreds of KB) even when nothing new was said — that's what was
+ * driving up egress on the relay's Postgres (Neon) instance.
  */
-export function readSessionTranscript(sessionId: string): {
+export function readSessionTranscript(
+  sessionId: string,
+  sinceTimestamp?: string,
+): {
   title: string;
   status: string | null;
   messages: SessionMessage[];
@@ -141,6 +152,11 @@ export function readSessionTranscript(sessionId: string): {
   for (const line of rawLines) {
     const message = parseMessageLine(line);
     if (message) allMessages.push(message);
+  }
+
+  if (sinceTimestamp) {
+    const tail = allMessages.filter((message) => message.timestamp > sinceTimestamp);
+    return { title, status, messages: tail, truncated: false };
   }
 
   const truncated = allMessages.length > MAX_MESSAGES_PER_SESSION;

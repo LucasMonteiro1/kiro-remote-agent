@@ -103,7 +103,7 @@ async function main() {
     try {
       const requests = await relay.pullSessionDetailRequests(sessionDetailCursor);
       for (const req of requests) {
-        const detail = readSessionTranscript(req.sessionId);
+        const detail = readSessionTranscript(req.sessionId, req.sinceTimestamp);
         if (detail) {
           // Only advance the cursor once the result is actually delivered.
           // If pushSessionDetailResult throws (network hiccup), stop here
