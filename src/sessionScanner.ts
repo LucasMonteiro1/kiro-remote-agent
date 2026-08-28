@@ -5,6 +5,17 @@ import { join } from 'path';
 const KIRO_SESSIONS_DIR = join(homedir(), '.kiro', 'sessions');
 const MAX_MESSAGES_PER_SESSION = 400; // cap payload size when reading a transcript
 const MAX_TITLE_LENGTH = 200;
+/**
+ * Upper bound on how many session summaries get synced to the relay, most
+ * recently modified first. Without this, the snapshot grows forever as
+ * ~/.kiro/sessions accumulates history across every project on the
+ * machine (it reached ~1,500 sessions / ~580KB after a few months) — and
+ * that whole payload gets re-sent on every daemon push (every
+ * SESSION_SCAN_INTERVAL_MS) and re-downloaded on every phone poll (every
+ * 20s while the sessions list is open), which is what was driving up
+ * Vercel's Fast Origin Transfer usage.
+ */
+const MAX_SYNCED_SESSIONS = 150;
 
 export interface SessionSummary {
   id: string;
@@ -86,7 +97,11 @@ export function scanSessionSummaries(): SessionSummary[] {
     }
   }
 
-  return summaries;
+  // Most recently touched first, capped to MAX_SYNCED_SESSIONS — old
+  // sessions from months ago aren't worth their share of every sync/poll
+  // payload when they're already effectively archived.
+  summaries.sort((a, b) => (b.lastModifiedAt ?? '').localeCompare(a.lastModifiedAt ?? ''));
+  return summaries.slice(0, MAX_SYNCED_SESSIONS);
 }
 
 /**
