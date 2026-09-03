@@ -6,12 +6,17 @@ import { z } from 'zod';
  * .env.example for the template.
  */
 const envSchema = z.object({
-  // --- Relay connection ---
-  RELAY_URL: z.string().url(),
-  AGENT_SHARED_SECRET: z.string().min(16),
+  // --- Hub server (replaces the old relay-polling connection) ---
+  /** Local port the WebSocket hub listens on. The Kiro Remote Bridge extension connects here directly (same machine); the phone/browser reaches it through a Cloudflare Tunnel pointed at this port. */
+  HUB_PORT: z.coerce.number().int().positive().default(8787),
+  /** Shared secret the Kiro Remote Bridge extension uses to authenticate to the hub. Must match kiroRemoteBridge.hubSecret in every IDE window's settings. */
+  HUB_SHARED_SECRET: z.string().min(16),
+  /** Signing secret for the short-lived owner token minted by the relay's /api/hub-token route. Must match HUB_TOKEN_SECRET on the relay. */
+  HUB_TOKEN_SECRET: z.string().min(32),
   HOST_LABEL: z.string().default('work-pc'),
-  POLL_INTERVAL_MS: z.coerce.number().int().positive().default(4000),
-  /** How often (ms) to scan ~/.kiro/sessions and push a fresh summary snapshot to the relay. */
+  /** Optional: Neon/Postgres connection string used only for a periodic durability backup of the in-memory event log. Leave unset to run fully in-memory. */
+  DATABASE_URL: z.string().optional(),
+  /** How often (ms) to scan ~/.kiro/sessions and push a fresh summary snapshot to the hub. */
   SESSION_SCAN_INTERVAL_MS: z.coerce.number().int().positive().default(45000),
 
   // --- kiro-cli process ---

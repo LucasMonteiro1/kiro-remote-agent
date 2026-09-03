@@ -22,22 +22,17 @@
         "kiroRemoteBridge.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Poll the relay and deliver remote replies into this window's Kiro chat sessions."
+          "description": "Connect to the local hub and deliver remote replies into this window's Kiro chat sessions."
         },
-        "kiroRemoteBridge.relayUrl": {
+        "kiroRemoteBridge.hubUrl": {
+          "type": "string",
+          "default": "ws://127.0.0.1:8787",
+          "description": "WebSocket URL of the kiro-remote-agent hub. This is local (same machine as the daemon) \u2014 not the Vercel relay."
+        },
+        "kiroRemoteBridge.hubSecret": {
           "type": "string",
           "default": "",
-          "description": "Base URL of your deployed kiro-remote-relay, e.g. https://kiro-remote-relay.vercel.app"
-        },
-        "kiroRemoteBridge.agentSecret": {
-          "type": "string",
-          "default": "",
-          "description": "Must match AGENT_SHARED_SECRET on the relay. Stored in your local settings \u2014 keep this machine trusted."
-        },
-        "kiroRemoteBridge.pollIntervalMs": {
-          "type": "number",
-          "default": 15000,
-          "description": "How often (ms) to poll the relay for new remote messages. Every poll spends Redis commands on the relay (Upstash free tier caps at 500K/month), and this runs per open IDE window, so keep this in step with kiro-remote-agent's POLL_INTERVAL_MS rather than lowering it alone."
+          "description": "Must match HUB_SHARED_SECRET in the kiro-remote-agent .env. Stored in your local settings \u2014 keep this machine trusted."
         }
       }
     },
@@ -56,9 +51,13 @@
     "build": "tsc -p .",
     "typecheck": "tsc --noEmit -p ."
   },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
   "devDependencies": {
     "@types/node": "^20.14.15",
     "@types/vscode": "^1.90.0",
+    "@types/ws": "^8.5.12",
     "typescript": "^5.5.4"
   }
 }

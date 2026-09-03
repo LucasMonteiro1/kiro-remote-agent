@@ -32,10 +32,14 @@ var __importStar = (this && this.__importStar) || (function () {
         return result;
     };
 })();
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
+const ws_1 = __importDefault(require("ws"));
 const fs_1 = require("fs");
 const os_1 = require("os");
 const path_1 = require("path");
@@ -43,7 +47,16 @@ const path_1 = require("path");
  * Kiro Remote Bridge
  *
  * Runs inside the Kiro IDE and delivers messages sent from the phone (via
- * kiro-remote-relay) into this window's real Kiro chat sessions.
+ * the local kiro-remote-agent hub) into this window's real Kiro chat
+ * sessions.
+ *
+ * This connects over a plain WebSocket to ws://127.0.0.1:<HUB_PORT> on the
+ * *same machine* the daemon runs on — not to any remote relay. There is no
+ * more polling: every event the hub broadcasts (a message from the phone,
+ * an approval decision, etc) arrives the instant it happens, pushed over
+ * this one persistent connection. If the connection drops (daemon
+ * restarted, laptop slept), this reconnects with a short backoff and picks
+ * back up — nothing is lost since the hub keeps its own in-memory log.
  *
  * Why this has to be an extension rather than part of the external daemon:
  * a Kiro chat session is owned by exactly one process, and the IDE owns the
@@ -57,43 +70,43 @@ const path_1 = require("path");
  * the IDE, hence this extension.
  */
 const KIRO_SESSIONS_DIR = (0, path_1.join)((0, os_1.homedir)(), '.kiro', 'sessions');
-const HOST_LABEL = 'kiro-ide';
-/** Sentinel sessionId meaning "create a brand new IDE session for this prompt". */
-const NEW_SESSION_SENTINEL = '__new__';
-const WATCH_INTERVAL_MS = 2000;
-/** How often to look for sessions in this window that should be streamed. */
-const DISCOVER_INTERVAL_MS = 10000;
 /** Only stream sessions touched this recently — old history isn't interesting. */
 const RECENT_WINDOW_MS = 24 * 60 * 60 * 1000;
 /** Upper bound on concurrently streamed sessions, most recently active first. */
 const MAX_WATCHED_SESSIONS = 12;
+/** How often to look for sessions in this window that should be streamed. */
+const DISCOVER_INTERVAL_MS = 10000;
+/** How often to tail each watched session's messages.jsonl for new lines. */
+const WATCH_INTERVAL_MS = 2000;
 /** Window for matching a file entry against a message we just delivered. */
 const ECHO_WINDOW_MS = 90 * 1000;
 /** Delay after sendPrompt before re-issuing viewSession, to work around the user's own bubble not appearing (see handleRemoteMessage). */
 const VIEW_REFRESH_DELAY_MS = 400;
 /** How long to wait for the IDE to confirm a dispatched approval decision actually resolved the tool call. */
 const APPROVAL_CONFIRM_TIMEOUT_MS = 6000;
+/** Sentinel sessionId meaning "create a brand new IDE session for this prompt". */
+const NEW_SESSION_SENTINEL = '__new__';
+/** Reconnect backoff bounds for the hub WebSocket connection. */
+const RECONNECT_MIN_MS = 1000;
+const RECONNECT_MAX_MS = 15000;
 let output;
-let pollTimer;
-// Start from "now" rather than 0: on activation we only care about messages
-// sent from here on. Replaying the whole backlog would re-deliver old
-// messages into live chat sessions.
-let cursor = Date.now();
-let lastPollError = null;
+let hubSocket;
+let lastError = null;
 let deliveredCount = 0;
 function activate(context) {
     output = vscode.window.createOutputChannel('Kiro Remote Bridge');
     context.subscriptions.push(output);
     context.subscriptions.push(vscode.commands.registerCommand('kiroRemoteBridge.showLog', () => output.show(true)), vscode.commands.registerCommand('kiroRemoteBridge.showStatus', () => {
-        const { enabled, relayUrl, agentSecret } = readConfig();
+        const config = readConfig();
         const parts = [
-            `Enabled: ${enabled}`,
-            `Relay: ${relayUrl || '(not set)'}`,
-            `Secret: ${agentSecret ? 'set' : '(not set)'}`,
+            `Enabled: ${config.enabled}`,
+            `Hub: ${config.hubUrl || '(not set)'}`,
+            `Secret: ${config.hubSecret ? 'set' : '(not set)'}`,
+            `Connected: ${hubSocket?.isConnected() ?? false}`,
             `Workspace: ${currentWorkspacePaths().join(', ') || '(none)'}`,
             `Delivered this session: ${deliveredCount}`,
             `Streaming sessions: ${watchers.size}`,
-            `Last error: ${lastPollError ?? 'none'}`,
+            `Last error: ${lastError ?? 'none'}`,
         ];
         vscode.window.showInformationMessage(parts.join(' · '), 'Show Log').then((choice) => {
             if (choice === 'Show Log')
@@ -102,24 +115,176 @@ function activate(context) {
     }));
     context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((event) => {
         if (event.affectsConfiguration('kiroRemoteBridge')) {
-            log('Configuration changed, restarting poll loop.');
-            restartPolling(context);
+            log('Configuration changed, reconnecting.');
+            restart();
         }
     }));
-    void maybeRunSelfTest();
-    restartPolling(context);
+    restart();
+}
+function deactivate() {
+    hubSocket?.close();
+    if (discoverTimer)
+        clearInterval(discoverTimer);
+    for (const watcher of watchers.values())
+        clearInterval(watcher.timer);
+    watchers.clear();
+}
+function restart() {
+    hubSocket?.close();
+    const config = readConfig();
+    if (!config.enabled) {
+        log('Disabled via kiroRemoteBridge.enabled.');
+        return;
+    }
+    if (!config.hubUrl || !config.hubSecret) {
+        log('Not configured: set kiroRemoteBridge.hubUrl and kiroRemoteBridge.hubSecret.');
+        return;
+    }
+    log(`Connecting to ${config.hubUrl} for workspace [${currentWorkspacePaths().join(', ')}]`);
+    hubSocket = new HubSocket(config, {
+        onEvent: (event) => void handleHubEvent(config, event),
+        onError: (message) => {
+            lastError = message;
+            log(`Hub error: ${message}`);
+        },
+    });
+    hubSocket.connect();
+    try {
+        ensureWatchers(config);
+    }
+    catch (err) {
+        log(`Initial discovery failed: ${describeError(err)}`);
+    }
+    startDiscovery(config);
+}
+/**
+ * Thin wrapper around a `ws` WebSocket that authenticates on connect and
+ * reconnects with backoff on any drop. This is the extension's *only*
+ * network dependency now — no more HTTP polling anywhere.
+ */
+class HubSocket {
+    config;
+    handlers;
+    ws = null;
+    reconnectDelay = RECONNECT_MIN_MS;
+    closed = false;
+    constructor(config, handlers) {
+        this.config = config;
+        this.handlers = handlers;
+    }
+    connect() {
+        if (this.closed)
+            return;
+        const ws = new ws_1.default(this.config.hubUrl);
+        this.ws = ws;
+        ws.on('open', () => {
+            this.reconnectDelay = RECONNECT_MIN_MS;
+            ws.send(JSON.stringify({
+                v: 1,
+                kind: 'hello',
+                role: 'extension',
+                secret: this.config.hubSecret,
+                hostLabel: HOST_LABEL,
+            }));
+        });
+        ws.on('message', (raw) => {
+            let msg;
+            try {
+                msg = JSON.parse(raw.toString());
+            }
+            catch {
+                return;
+            }
+            if (msg.kind === 'event' && msg.event) {
+                this.handlers.onEvent(msg.event);
+            }
+        });
+        ws.on('close', (code, reason) => {
+            if (this.closed)
+                return;
+            this.handlers.onError(`connection closed (${code} ${reason.toString()}), reconnecting...`);
+            this.scheduleReconnect();
+        });
+        ws.on('error', (err) => {
+            this.handlers.onError(describeError(err));
+        });
+    }
+    isConnected() {
+        return this.ws?.readyState === ws_1.default.OPEN;
+    }
+    /** Fire-and-forget send used for push_event/resolve_approval/claim_event — matches the old push()'s "log and swallow" error handling, since nothing here blocks on a response except claim (handled separately). */
+    send(payload) {
+        if (this.ws?.readyState !== ws_1.default.OPEN)
+            return;
+        this.ws.send(JSON.stringify(payload));
+    }
+    /** Sends a claim_event and waits for the matching claim_result. */
+    claim(eventId) {
+        return new Promise((resolve) => {
+            if (this.ws?.readyState !== ws_1.default.OPEN) {
+                resolve(false);
+                return;
+            }
+            const onMessage = (raw) => {
+                try {
+                    const msg = JSON.parse(raw.toString());
+                    if (msg.kind === 'claim_result' && msg.eventId === eventId) {
+                        this.ws?.off('message', onMessage);
+                        resolve(!!msg.claimed);
+                    }
+                }
+                catch {
+                    // ignore
+                }
+            };
+            this.ws.on('message', onMessage);
+            this.ws.send(JSON.stringify({ v: 1, kind: 'claim_event', eventId, by: HOST_LABEL }));
+            setTimeout(() => {
+                this.ws?.off('message', onMessage);
+                resolve(false);
+            }, 5000);
+        });
+    }
+    /** Sends a request_session_detail and resolves with the result (or rejects on error/timeout). Not currently used by this extension — session detail requests are answered directly by the daemon — kept for completeness/future use. */
+    close() {
+        this.closed = true;
+        this.ws?.close();
+        this.ws = null;
+    }
+    scheduleReconnect() {
+        setTimeout(() => {
+            if (this.closed)
+                return;
+            this.connect();
+        }, this.reconnectDelay);
+        this.reconnectDelay = Math.min(this.reconnectDelay * 2, RECONNECT_MAX_MS);
+    }
+}
+async function handleHubEvent(config, event) {
+    // Untagged events belong to the daemon's own separate default chat, not
+    // any local IDE session — nothing here is ours to act on.
+    if (!event.sessionId)
+        return;
+    if (event.type === 'user_message' && event.text) {
+        await handleRemoteMessage(config, event.sessionId, event.text, event.id);
+    }
+    else if (event.type === 'approval_response' && event.requestId && event.decision) {
+        await handleRemoteApprovalResponse(config, event.sessionId, event.requestId, event.decision, event.id);
+    }
 }
 let discoverTimer;
 /**
  * Keeps streaming in sync with the window on a timer, so sessions you drive
  * directly in the IDE reach the phone without being started from the web.
+ * This part is still a timer (nothing to "push" here — it's a local
+ * filesystem scan, not something the hub can notify us about), but it no
+ * longer touches the network at all.
  */
-function startDiscovery() {
+function startDiscovery(config) {
     if (discoverTimer)
         clearInterval(discoverTimer);
     discoverTimer = setInterval(() => {
-        const config = readConfig();
-        if (!config.enabled || !config.relayUrl || !config.agentSecret)
+        if (!config.enabled)
             return;
         try {
             ensureWatchers(config);
@@ -129,114 +294,11 @@ function startDiscovery() {
         }
     }, DISCOVER_INTERVAL_MS);
 }
-/**
- * One-shot verification that this window can actually drive a chat session
- * through the IDE's own agent client. Runs only if a marker file exists
- * (created by hand), in a throwaway session, and writes what happened to a
- * result file. Used to confirm the wiring without touching real sessions.
- */
-async function maybeRunSelfTest() {
-    const markerPath = (0, path_1.join)((0, os_1.homedir)(), '.kiro-remote-bridge-selftest');
-    const resultPath = (0, path_1.join)((0, os_1.homedir)(), '.kiro-remote-bridge-selftest-result.txt');
-    try {
-        (0, fs_1.statSync)(markerPath);
-    }
-    catch {
-        return; // no marker, nothing to do
-    }
-    const lines = [`started ${new Date().toISOString()}`];
-    try {
-        (0, fs_1.unlinkSync)(markerPath); // run at most once per marker
-    }
-    catch {
-        // ignore
-    }
-    try {
-        const commands = await vscode.commands.getCommands(true);
-        lines.push(`sendPrompt command registered: ${commands.includes('kiroAgent.sessions.sendPrompt')}`);
-        lines.push(`create command registered: ${commands.includes('kiroAgent.sessions.create')}`);
-        const created = (await vscode.commands.executeCommand('kiroAgent.sessions.create'));
-        lines.push(`created sessionId: ${created?.sessionId ?? '(none)'}`);
-        if (created?.sessionId) {
-            await vscode.commands.executeCommand('kiroAgent.sessions.sendPrompt', created.sessionId, 'selftest do kiro-remote-bridge: responda apenas "ok"');
-            lines.push('sendPrompt resolved without throwing');
-        }
-        lines.push('RESULT: PASS');
-    }
-    catch (err) {
-        lines.push(`RESULT: FAIL — ${describeError(err)}`);
-    }
-    try {
-        (0, fs_1.writeFileSync)(resultPath, lines.join('\n') + '\n');
-    }
-    catch {
-        // ignore
-    }
-    log(lines.join(' | '));
-}
-function deactivate() {
-    if (pollTimer)
-        clearTimeout(pollTimer);
-    if (discoverTimer)
-        clearInterval(discoverTimer);
-    for (const watcher of watchers.values())
-        clearInterval(watcher.timer);
-    watchers.clear();
-}
-function restartPolling(context) {
-    if (pollTimer)
-        clearTimeout(pollTimer);
-    const { enabled, relayUrl, agentSecret } = readConfig();
-    if (!enabled) {
-        log('Disabled via kiroRemoteBridge.enabled.');
-        return;
-    }
-    if (!relayUrl || !agentSecret) {
-        log('Not configured: set kiroRemoteBridge.relayUrl and kiroRemoteBridge.agentSecret.');
-        return;
-    }
-    log(`Polling ${relayUrl} for workspace [${currentWorkspacePaths().join(', ')}]`);
-    try {
-        ensureWatchers(readConfig());
-    }
-    catch (err) {
-        log(`Initial discovery failed: ${describeError(err)}`);
-    }
-    startDiscovery();
-    void pollLoop(context);
-}
-async function pollLoop(context) {
-    const config = readConfig();
-    if (!config.enabled || !config.relayUrl || !config.agentSecret)
-        return;
-    try {
-        const events = await pull(config.relayUrl, config.agentSecret);
-        lastPollError = null;
-        for (const event of events) {
-            // Untagged events belong to the daemon's own separate default chat, not
-            // any local IDE session — nothing here is ours to act on.
-            if (!event.sessionId)
-                continue;
-            if (event.type === 'user_message' && event.text) {
-                await handleRemoteMessage(config, event.sessionId, event.text, event.id);
-            }
-            else if (event.type === 'approval_response' && event.requestId && event.decision) {
-                await handleRemoteApprovalResponse(config, event.sessionId, event.requestId, event.decision, event.id);
-            }
-        }
-    }
-    catch (err) {
-        lastPollError = describeError(err);
-        log(`Poll failed: ${lastPollError}`);
-    }
-    finally {
-        pollTimer = setTimeout(() => void pollLoop(context), config.pollIntervalMs);
-    }
-}
+const HOST_LABEL = 'kiro-ide';
 /**
  * Delivers one remote message into a local session, if that session belongs
  * to this window. Every Kiro window runs its own copy of this extension, so
- * we filter by workspace and then claim the message on the relay to make
+ * we filter by workspace and then claim the message on the hub to make
  * sure exactly one window delivers it.
  */
 async function handleRemoteMessage(config, sessionId, text, eventId) {
@@ -246,7 +308,7 @@ async function handleRemoteMessage(config, sessionId, text, eventId) {
     // existing session, only the window that owns its workspace handles it.
     if (!isNew && !sessionBelongsToThisWindow(sessionId))
         return;
-    const claimed = await claim(config.relayUrl, config.agentSecret, eventId);
+    const claimed = (await hubSocket?.claim(eventId)) ?? false;
     if (!claimed) {
         log(`Skipped ${shortId(sessionId)}: another window already claimed this message.`);
         return;
@@ -260,7 +322,7 @@ async function handleRemoteMessage(config, sessionId, text, eventId) {
             targetSessionId = created.sessionId;
             log(`Created new session ${shortId(targetSessionId)}`);
             // Tell the phone which session was created so it can open that thread.
-            await push(config, {
+            push({
                 type: 'status',
                 text: `session:${targetSessionId}`,
                 sessionId: NEW_SESSION_SENTINEL,
@@ -293,7 +355,7 @@ async function handleRemoteMessage(config, sessionId, text, eventId) {
     catch (err) {
         const message = describeError(err);
         log(`Failed to deliver to ${shortId(sessionId)}: ${message}`);
-        await pushError(config, sessionId, `Falha ao entregar no Kiro IDE: ${message}`);
+        pushError(sessionId, `Falha ao entregar no Kiro IDE: ${message}`);
     }
 }
 /**
@@ -324,7 +386,7 @@ async function handleRemoteApprovalResponse(config, sessionId, requestId, decisi
         // already resolved (e.g. answered directly in the IDE). Nothing to do.
         return;
     }
-    const claimed = await claim(config.relayUrl, config.agentSecret, eventId);
+    const claimed = (await hubSocket?.claim(eventId)) ?? false;
     if (!claimed)
         return;
     const command = approvalCommandForDecision(decision);
@@ -332,7 +394,7 @@ async function handleRemoteApprovalResponse(config, sessionId, requestId, decisi
         log(`Unknown approval decision "${decision}" for ${shortId(sessionId)}, ignoring.`);
         return;
     }
-    approvalQueue = approvalQueue.then(() => dispatchApprovalDecision(config, sessionId, requestId, command));
+    approvalQueue = approvalQueue.then(() => dispatchApprovalDecision(sessionId, requestId, command));
     await approvalQueue;
 }
 function approvalCommandForDecision(decision) {
@@ -347,7 +409,7 @@ function approvalCommandForDecision(decision) {
             return undefined;
     }
 }
-async function dispatchApprovalDecision(config, sessionId, requestId, command) {
+async function dispatchApprovalDecision(sessionId, requestId, command) {
     try {
         // Make sure the right panel is focused before firing a command that acts
         // on "the currently active panel" rather than a session id.
@@ -357,16 +419,16 @@ async function dispatchApprovalDecision(config, sessionId, requestId, command) {
         const confirmed = await waitForApprovalResolved(requestId, APPROVAL_CONFIRM_TIMEOUT_MS);
         if (!confirmed) {
             log(`Approval ${shortId(requestId)} on ${shortId(sessionId)} was not confirmed resolved within ${APPROVAL_CONFIRM_TIMEOUT_MS}ms.`);
-            await pushError(config, sessionId, 'Não foi possível confirmar que a aprovação foi aplicada no IDE. Verifique a sessão diretamente.');
+            pushError(sessionId, 'Não foi possível confirmar que a aprovação foi aplicada no IDE. Verifique a sessão diretamente.');
         }
     }
     catch (err) {
         const message = describeError(err);
         log(`Failed to dispatch ${command} for ${shortId(sessionId)}: ${message}`);
-        await pushError(config, sessionId, `Falha ao aplicar aprovação no Kiro IDE: ${message}`);
+        pushError(sessionId, `Falha ao aplicar aprovação no Kiro IDE: ${message}`);
     }
 }
-/** Polls until `pendingApprovals` no longer has this entry (cleared by the matching interaction_resolved), or times out. */
+/** Polls until `pendingApprovals` no longer has this entry (cleared by the matching interaction_resolved), or times out. This one stays a short local poll — it's watching this window's own in-memory map, not the network. */
 async function waitForApprovalResolved(requestId, timeoutMs) {
     const pollStep = 300;
     const deadline = Date.now() + timeoutMs;
@@ -381,10 +443,10 @@ const watchers = new Map();
 /** Messages this window delivered, so the file echo of them isn't re-sent. */
 const recentlyDelivered = [];
 /**
- * Tracks tool approval prompts this window has surfaced to the relay, so an
- * approval_response from the phone (which only carries the relay's own
- * event id) can be mapped back to the Kiro-side toolCallId it answers.
- * Cleared once the interaction resolves, one way or another.
+ * Tracks tool approval prompts this window has surfaced to the hub, so an
+ * approval_response from the phone (which only carries the hub's own event
+ * id) can be mapped back to the Kiro-side toolCallId it answers. Cleared
+ * once the interaction resolves, one way or another.
  */
 const pendingApprovals = new Map();
 /** toolCallId -> display title, filled in from the preceding tool_call entry so the approval card can show what's being approved. */
@@ -401,10 +463,6 @@ let approvalQueue = Promise.resolve();
  * Keeps the set of streamed sessions in sync with what's actually active in
  * this window: every session of this workspace touched in the last day, most
  * recent first, capped so we don't tail hundreds of old files.
- *
- * This runs on a timer rather than only when the phone sends something, so a
- * session you started and are driving inside the IDE also streams to the
- * phone without you having to touch the web first.
  */
 function ensureWatchers(config) {
     const candidates = recentSessionsForThisWindow().slice(0, MAX_WATCHED_SESSIONS);
@@ -425,8 +483,8 @@ function ensureWatchers(config) {
  *
  * The IDE appends every turn to the session's own messages.jsonl, so we tail
  * that file from wherever it currently ends and forward new entries to the
- * relay as normal events. The phone already polls the event log, so this
- * works without depending on the daemon reading transcripts.
+ * hub as normal events — the hub then pushes them straight to the phone,
+ * no polling on either end.
  */
 function watchSessionForReplies(config, sessionId) {
     if (watchers.has(sessionId))
@@ -441,7 +499,7 @@ function watchSessionForReplies(config, sessionId) {
         offset: fileSize(messagesPath), // only forward what comes after this point
         timer: setInterval(() => {
             try {
-                tickWatcher(config, sessionId, messagesPath);
+                tickWatcher(sessionId, messagesPath);
             }
             catch (err) {
                 log(`Watcher error for ${shortId(sessionId)}: ${describeError(err)}`);
@@ -451,7 +509,7 @@ function watchSessionForReplies(config, sessionId) {
     watchers.set(sessionId, watcher);
     log(`Watching ${shortId(sessionId)} (from byte ${watcher.offset}).`);
 }
-function tickWatcher(config, sessionId, messagesPath) {
+function tickWatcher(sessionId, messagesPath) {
     const watcher = watchers.get(sessionId);
     if (!watcher)
         return;
@@ -469,11 +527,11 @@ function tickWatcher(config, sessionId, messagesPath) {
         return;
     watcher.offset += Buffer.byteLength(chunk.slice(0, lastNewline + 1), 'utf8');
     for (const line of chunk.slice(0, lastNewline).split('\n')) {
-        forwardLine(config, sessionId, line);
+        forwardLine(sessionId, line);
     }
 }
-/** Turns one messages.jsonl line into a relay event, skipping bookkeeping entries. */
-function forwardLine(config, sessionId, line) {
+/** Turns one messages.jsonl line into a hub event, skipping bookkeeping entries. */
+function forwardLine(sessionId, line) {
     if (!line.trim())
         return;
     let payload;
@@ -491,7 +549,7 @@ function forwardLine(config, sessionId, line) {
         // A message sent from the phone is already in the event log; the IDE
         // writing it to the file would otherwise show up as a second bubble.
         if (text && !wasJustDelivered(sessionId, text)) {
-            void push(config, { type: 'user_message', text, sessionId });
+            push({ type: 'user_message', text, sessionId });
         }
         return;
     }
@@ -505,7 +563,7 @@ function forwardLine(config, sessionId, line) {
         // what lets the phone collapse thinking the way the IDE does instead of
         // showing it as a second answer bubble.
         const isReasoning = String(payload.operationType ?? '') === 'Reasoning';
-        void push(config, {
+        push({
             type: isReasoning ? 'thought' : 'assistant_message',
             text,
             sessionId,
@@ -523,7 +581,7 @@ function forwardLine(config, sessionId, line) {
         const toolCallId = typeof payload.toolCallId === 'string' ? payload.toolCallId : undefined;
         if (toolCallId)
             toolTitleByCallId.set(toolCallId, title);
-        void push(config, {
+        push({
             type: 'tool_call',
             title: title.slice(0, 490),
             ...(toolName ? { toolName: toolName.slice(0, 200) } : {}),
@@ -540,15 +598,15 @@ function forwardLine(config, sessionId, line) {
             return;
         const question = typeof payload.question === 'string' ? payload.question : 'tool_approval';
         const title = toolTitleByCallId.get(toolCallId);
-        void push(config, {
-            type: 'approval_request',
-            promptText: question,
-            ...(title ? { toolName: title } : {}),
-            sessionId,
-        }).then((relayEventId) => {
-            if (relayEventId)
-                pendingApprovals.set(relayEventId, { sessionId, toolCallId });
-        });
+        // push_event doesn't return the hub-assigned id synchronously (it's a
+        // fire-and-forget send over the socket), so unlike the old HTTP
+        // request/response push(), we can't learn the relay-assigned event id
+        // this way anymore. Instead the hub assigns a deterministic id: we
+        // generate it here and pass it through, and the hub uses it as-is
+        // rather than minting its own — see hub.ts's emitEvent falling back to
+        // a caller-supplied id when present.
+        const relayEventId = pushApprovalRequest(question, sessionId, title);
+        pendingApprovals.set(relayEventId, { sessionId, toolCallId });
         return;
     }
     if (type === 'interaction_resolved') {
@@ -563,7 +621,7 @@ function forwardLine(config, sessionId, line) {
                 continue;
             pendingApprovals.delete(relayEventId);
             const decision = decisionFromSelectedOption(typeof payload.selectedOption === 'string' ? payload.selectedOption : undefined);
-            void resolveApprovalOnRelay(config, relayEventId, decision);
+            resolveApprovalOnHub(relayEventId, decision);
             break;
         }
     }
@@ -798,85 +856,35 @@ function readSessionWorkspacePaths(sessionId) {
 function currentWorkspacePaths() {
     return (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath);
 }
-// --- relay calls ---
-async function pull(relayUrl, secret) {
-    const url = new URL('/api/agent/pull', relayUrl);
-    url.searchParams.set('since', String(cursor));
-    url.searchParams.set('host', HOST_LABEL);
-    const res = await fetch(url, { headers: { Authorization: `Bearer ${secret}` } });
-    if (!res.ok)
-        throw new Error(`pull ${res.status}`);
-    const body = (await res.json());
-    if (body.events.length > 0) {
-        cursor = Math.max(cursor, ...body.events.map((event) => event.createdAt));
-    }
-    return body.events;
+// --- hub calls ---
+function push(payload) {
+    hubSocket?.send({ v: 1, kind: 'push_event', event: payload });
 }
-/** Atomic "only one window handles this message" check. */
-async function claim(relayUrl, secret, eventId) {
-    const url = new URL('/api/agent/claim', relayUrl);
-    const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${secret}` },
-        body: JSON.stringify({ eventId, by: HOST_LABEL }),
-    });
-    if (!res.ok)
-        throw new Error(`claim ${res.status}`);
-    const body = (await res.json());
-    return body.claimed;
-}
-async function pushStatus(config, sessionId, text) {
-    await push(config, { type: 'status', text, sessionId });
-}
-async function pushError(config, sessionId, text) {
-    await push(config, { type: 'error', text, sessionId });
-}
-/** Returns the relay-assigned id of the created event, or undefined if the push failed. */
-async function push(config, payload) {
-    try {
-        const url = new URL('/api/agent/push', config.relayUrl);
-        const res = await fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.agentSecret}` },
-            body: JSON.stringify(payload),
-        });
-        if (!res.ok)
-            throw new Error(`push ${res.status}`);
-        const body = (await res.json());
-        return body.event?.id;
-    }
-    catch (err) {
-        log(`Push failed: ${describeError(err)}`);
-        return undefined;
-    }
+function pushError(sessionId, text) {
+    push({ type: 'error', text, sessionId });
 }
 /**
- * Tells the relay an approval_request has been resolved, without going
- * through the phone's owner-session route — used when the developer
- * answered a prompt directly in the IDE.
+ * Approval requests need their id known synchronously (to key
+ * `pendingApprovals` before any response could possibly arrive), but
+ * push_event over a fire-and-forget socket send doesn't give us one back
+ * the way the old HTTP push() did. We generate the id here instead and
+ * send it as part of the event; the hub uses a caller-supplied id when
+ * present instead of minting its own (see hub.ts).
  */
-async function resolveApprovalOnRelay(config, relayEventId, decision) {
-    try {
-        const url = new URL('/api/agent/approvals/resolve', config.relayUrl);
-        const res = await fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.agentSecret}` },
-            body: JSON.stringify({ requestId: relayEventId, decision }),
-        });
-        if (!res.ok)
-            throw new Error(`resolve ${res.status}`);
-    }
-    catch (err) {
-        log(`Resolve approval failed: ${describeError(err)}`);
-    }
+function pushApprovalRequest(promptText, sessionId, toolName) {
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    push({ id, type: 'approval_request', promptText, toolName, sessionId });
+    return id;
+}
+function resolveApprovalOnHub(requestId, decision) {
+    hubSocket?.send({ v: 1, kind: 'resolve_approval', requestId, decision });
 }
 function readConfig() {
     const config = vscode.workspace.getConfiguration('kiroRemoteBridge');
     return {
         enabled: config.get('enabled', true),
-        relayUrl: (config.get('relayUrl', '') ?? '').replace(/\/+$/, ''),
-        agentSecret: config.get('agentSecret', '') ?? '',
-        pollIntervalMs: config.get('pollIntervalMs', 4000),
+        hubUrl: (config.get('hubUrl', '') ?? '').replace(/\/+$/, ''),
+        hubSecret: config.get('hubSecret', '') ?? '',
     };
 }
 function shortId(sessionId) {
