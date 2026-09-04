@@ -2,7 +2,7 @@
   "name": "kiro-remote-agent",
   "version": "0.1.0",
   "private": true,
-  "description": "Local daemon that bridges a kiro-cli session to a WebSocket hub it hosts itself, so you can keep chatting with your Kiro agent from your phone (via a Cloudflare Tunnel) while it keeps running on your work machine.",
+  "description": "Local daemon that bridges a kiro-cli session to a Discord bot, so you can keep chatting with your Kiro agent from your phone (via Discord) while it keeps running on your work machine.",
   "bin": {
     "kiro-remote-agent": "dist/index.js"
   },
@@ -11,14 +11,12 @@
     "dev": "tsx src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit",
-    "db:migrate": "node scripts/migrate.mjs"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@neondatabase/serverless": "^1.1.0",
     "@xterm/headless": "^6.0.0",
+    "discord.js": "^14.16.3",
     "dotenv": "^16.4.5",
-    "jose": "^5.9.6",
     "node-pty": "^1.0.0",
     "ws": "^8.18.0",
     "zod": "^3.23.8"

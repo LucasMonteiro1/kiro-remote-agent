@@ -2,3 +2,5 @@ src/**
 tsconfig.json
 node_modules/**
 *.vsix
+install-local.sh
+.DS_Store

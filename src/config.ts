@@ -6,17 +6,22 @@ import { z } from 'zod';
  * .env.example for the template.
  */
 const envSchema = z.object({
-  // --- Hub server (replaces the old relay-polling connection) ---
-  /** Local port the WebSocket hub listens on. The Kiro Remote Bridge extension connects here directly (same machine); the phone/browser reaches it through a Cloudflare Tunnel pointed at this port. */
+  // --- Local hub server (talks only to the Kiro Remote Bridge IDE extension) ---
+  /** Local port the WebSocket hub listens on. Only the Kiro Remote Bridge extension connects here — it's not exposed to the internet. */
   HUB_PORT: z.coerce.number().int().positive().default(8787),
   /** Shared secret the Kiro Remote Bridge extension uses to authenticate to the hub. Must match kiroRemoteBridge.hubSecret in every IDE window's settings. */
   HUB_SHARED_SECRET: z.string().min(16),
-  /** Signing secret for the short-lived owner token minted by the relay's /api/hub-token route. Must match HUB_TOKEN_SECRET on the relay. */
-  HUB_TOKEN_SECRET: z.string().min(32),
   HOST_LABEL: z.string().default('work-pc'),
-  /** Optional: Neon/Postgres connection string used only for a periodic durability backup of the in-memory event log. Leave unset to run fully in-memory. */
-  DATABASE_URL: z.string().optional(),
-  /** How often (ms) to scan ~/.kiro/sessions and push a fresh summary snapshot to the hub. */
+
+  // --- Discord (the remote client — replaces the old phone/browser PWA + relay + tunnel) ---
+  /** Bot token from the Discord Developer Portal (Application -> Bot -> Reset Token). */
+  DISCORD_BOT_TOKEN: z.string().min(1),
+  /** ID of the forum channel where session threads are created. Right-click the channel in Discord (Developer Mode enabled) -> Copy Channel ID. */
+  DISCORD_FORUM_CHANNEL_ID: z.string().min(1),
+  /** Where the sessionId <-> Discord thread id mapping is persisted, so restarting the daemon reuses existing threads instead of creating duplicates. */
+  DISCORD_THREAD_MAP_PATH: z.string().default('./discord-threads.json'),
+
+  /** How often (ms) to scan ~/.kiro/sessions and refresh the daemon's local cache of Kiro IDE session titles/status (used only to label new Discord threads). */
   SESSION_SCAN_INTERVAL_MS: z.coerce.number().int().positive().default(45000),
 
   // --- kiro-cli process ---

@@ -1,10 +1,14 @@
 {
   "name": "kiro-remote-bridge",
   "displayName": "Kiro Remote Bridge",
-  "description": "Bridges your kiro-remote-relay to this Kiro IDE window, so you can reply to IDE chat sessions from your phone.",
+  "description": "Bridges your kiro-remote-agent hub to this Kiro IDE window, so you can reply to IDE chat sessions from Discord.",
   "version": "0.1.0",
   "publisher": "lucasmonteiro",
   "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LucasMonteiro1/kiro-remote-agent"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -27,12 +31,12 @@
         "kiroRemoteBridge.hubUrl": {
           "type": "string",
           "default": "ws://127.0.0.1:8787",
-          "description": "WebSocket URL of the kiro-remote-agent hub. This is local (same machine as the daemon) \u2014 not the Vercel relay."
+          "description": "WebSocket URL of the kiro-remote-agent hub. This is local (same machine as the daemon) — not the Vercel relay."
         },
         "kiroRemoteBridge.hubSecret": {
           "type": "string",
           "default": "",
-          "description": "Must match HUB_SHARED_SECRET in the kiro-remote-agent .env. Stored in your local settings \u2014 keep this machine trusted."
+          "description": "Must match HUB_SHARED_SECRET in the kiro-remote-agent .env. Stored in your local settings — keep this machine trusted."
         }
       }
     },
@@ -48,16 +52,17 @@
     ]
   },
   "scripts": {
-    "build": "tsc -p .",
-    "typecheck": "tsc --noEmit -p ."
-  },
-  "dependencies": {
-    "ws": "^8.18.0"
+    "build": "esbuild src/extension.ts --bundle --platform=node --format=cjs --target=node18 --external:vscode --outfile=dist/extension.js",
+    "typecheck": "tsc --noEmit -p .",
+    "package": "yarn build && vsce package --no-yarn --skip-license"
   },
   "devDependencies": {
     "@types/node": "^20.14.15",
     "@types/vscode": "^1.90.0",
     "@types/ws": "^8.5.12",
-    "typescript": "^5.5.4"
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.5.4",
+    "ws": "^8.18.0"
   }
 }

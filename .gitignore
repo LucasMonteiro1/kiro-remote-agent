@@ -1,7 +1,9 @@
-/node_modules
-/dist
+node_modules
+dist
 .env
 .env.local
 *.log
 kiro-remote-agent-debug.log
+discord-threads.json
 .DS_Store
+*.vsix

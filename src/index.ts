@@ -1,16 +1,18 @@
 import 'dotenv/config';
 import { loadConfig } from './config';
 import { Hub } from './hub';
+import { DiscordBot } from './discordBot';
 import { KiroSession } from './kiroSession';
-import { scanSessionSummaries, readSessionTranscript } from './sessionScanner';
+import { scanSessionSummaries } from './sessionScanner';
 import type { HubEvent } from './hubProtocol';
 
 async function main() {
   const config = loadConfig();
   const hub = new Hub(config);
+  const discord = new DiscordBot(config, hub);
 
   // requestId -> resolve callback, used to route an approval decision from
-  // the phone back into a "send keystrokes to the PTY" action, for the
+  // Discord back into a "send keystrokes to the PTY" action, for the
   // daemon's own fixed default session.
   let lastApprovalRequestId: string | null = null;
 
@@ -30,27 +32,10 @@ async function main() {
 
   session.start();
   hub.pushStatus(`Agente conectado em ${config.HOST_LABEL}.`);
-
-  // Session transcript requests from the phone are answered directly here
-  // — the hub and this daemon share the same filesystem, so unlike the old
-  // design (phone -> relay -> queue -> daemon polls -> relay -> phone
-  // polls), there's no round trip through anything at all beyond this one
-  // read + one reply.
-  hub.onSessionDetailRequest = (ws, requestId, sessionId, since) => {
-    try {
-      const detail = readSessionTranscript(sessionId, since);
-      if (!detail) {
-        hub.replySessionDetailError(ws, requestId, 'Sessão não encontrada em ~/.kiro/sessions neste PC.');
-        return;
-      }
-      hub.replySessionDetail(ws, requestId, { sessionId, ...detail });
-    } catch (err) {
-      hub.replySessionDetailError(ws, requestId, describeError(err));
-    }
-  };
+  await discord.start();
 
   // Events for the daemon's own default chat arrive as direct hub
-  // callbacks now, not through a poll loop — no network hop, no delay.
+  // callbacks — no network hop, no polling, no delay.
   hub.onUserMessage = (event: HubEvent) => {
     if (event.type !== 'user_message') return;
     // Events tagged with a sessionId target a Kiro IDE chat session. Those
@@ -73,9 +58,8 @@ async function main() {
   };
 
   // --- Local Kiro IDE session history tracking (read-only, ~/.kiro/sessions) ---
-  // This still needs a timer (scanning the filesystem isn't event-driven),
-  // but it's now a local push to the in-process hub instead of an HTTP
-  // POST to a remote relay.
+  // Only used to label newly created Discord threads with a session's real
+  // title instead of a raw id — no longer broadcast anywhere.
   function sessionScanLoop(): void {
     try {
       const summaries = scanSessionSummaries();
@@ -89,8 +73,8 @@ async function main() {
 
   sessionScanLoop();
 
-  process.on('SIGINT', () => shutdown(session, hub));
-  process.on('SIGTERM', () => shutdown(session, hub));
+  process.on('SIGINT', () => shutdown(session, hub, discord));
+  process.on('SIGTERM', () => shutdown(session, hub, discord));
 }
 
 function applyApprovalDecision(
@@ -111,18 +95,14 @@ function applyApprovalDecision(
   }
 }
 
-function shutdown(session: KiroSession, hub: Hub): void {
+function shutdown(session: KiroSession, hub: Hub, discord: DiscordBot): void {
   session.stop();
   hub.stop();
-  process.exit(0);
+  void discord.stop().finally(() => process.exit(0));
 }
 
 function logError(context: string, err: unknown): void {
   console.error(`[kiro-remote-agent] ${context} failed:`, err);
-}
-
-function describeError(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
 
 main().catch((err) => {
