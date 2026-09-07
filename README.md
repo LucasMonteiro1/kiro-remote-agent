@@ -51,6 +51,41 @@ nenhuma infraestrutura própria (sem relay, sem túnel, sem banco de dados).
 O código, credenciais, MCPs e terminal continuam **100% no seu PC**. O
 Discord só vê texto de mensagens e prompts de aprovação.
 
+### Enviar imagens pelo Discord
+
+Você pode anexar uma imagem numa mensagem do Discord (com ou sem legenda —
+uma mensagem só com imagem também funciona) e o Kiro entende a imagem. Por
+baixo dos panos:
+
+1. O bot detecta anexos de imagem (por `content-type` ou extensão).
+2. Cada imagem é **baixada para um arquivo temporário local** no seu PC
+   (`$TMPDIR/kiro-remote-images/`), com nome aleatório (limite de 25 MB).
+3. O caminho absoluto do arquivo é adicionado ao prompt, e o Kiro lê a
+   imagem com suas próprias ferramentas de arquivo — funciona tanto na
+   sessão padrão (`kiro-cli`) quanto nas sessões do Kiro IDE (via
+   `sendPrompt`).
+
+As URLs de anexo do Discord são temporárias, então o download acontece na
+hora da entrega. Se um download falhar, o texto é enviado mesmo assim (você
+não fica sem resposta). As imagens ficam no seu PC — o Discord é só o
+transporte.
+
+### Título das threads: `[projeto] título da sessão`
+
+O nome de cada thread no Discord reflete o título que o **próprio Kiro** dá
+à sessão, prefixado com o **nome do workspace/projeto** aberto — assim, de
+relance, você sabe em qual projeto está mexendo. Exemplo:
+`[meu-projeto] Corrigir bug no login`.
+
+- O prefixo vem do nome da pasta do workspace da sessão (ou de
+  `KIRO_PROJECT_DIR` para a sessão padrão).
+- Sessão recém-criada nasce como `[projeto] Sessão a1b2c3d4` e é renomeada
+  automaticamente assim que o Kiro gera o título de verdade (o daemon
+  reconcilia os títulos a cada scan de `~/.kiro/sessions`).
+- A API do Discord só é chamada quando o nome realmente muda — o Discord
+  limita renomeação de canal de forma agressiva (~2 a cada 10 min), então
+  um reconcile sem mudança não gera tráfego.
+
 ## Por que isso é melhor que polling num relay remoto
 
 As duas versões anteriores deste projeto passaram por: (1) polling HTTPS
@@ -303,4 +338,5 @@ entre reinicializações — veja `launchctl` / `~/Library/LaunchAgents`.
   desligado (só não recebe novas respostas até o daemon voltar).
 - Mensagens muito longas (>2000 caracteres, limite do Discord) são
   quebradas automaticamente em várias mensagens.
-- Sem suporte a anexos/imagens vindos do lado do Kiro — apenas texto.
+- As respostas do Kiro para o Discord continuam sendo texto — imagens
+  geradas/lidas pelo agente não são renderizadas de volta no Discord.
