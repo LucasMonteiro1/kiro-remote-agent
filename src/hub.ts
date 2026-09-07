@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import { WebSocket, WebSocketServer } from 'ws';
 import type { AgentConfig } from './config';
-import type { ClientToHub, HubEvent, HubToClient, ToolApprovalDecision } from './hubProtocol';
+import type { ClientToHub, HubEvent, HubToClient, MessageAttachment, ToolApprovalDecision } from './hubProtocol';
 import type { SessionSummary } from './sessionScanner';
 
 const MAX_EVENTS_IN_MEMORY = 2000; // bounds the internal approval-lookup index; Discord itself is now the durable chat log
@@ -68,9 +68,26 @@ export class Hub {
 
   // --- called by Discord (the new "owner") ---
 
-  /** Sends a chat message, either into the daemon's own default session (sessionId omitted) or a specific local IDE session/new-session flow. */
-  sendUserMessage(text: string, sessionId?: string): HubEvent {
-    const event = this.emitEvent({ type: 'user_message', text, sessionId });
+  /**
+   * Sends a chat message, either into the daemon's own default session
+   * (sessionId omitted) or a specific local IDE session/new-session flow.
+   *
+   * `id`, if supplied, lets the caller (discordBot.ts) recognize this exact
+   * event when it comes back through `onEvent` — since `recordAndBroadcast`
+   * notifies `onEvent` synchronously, before this method even returns, the
+   * caller has to pre-register the id *before* calling this, not after.
+   * discordBot.ts uses this to tell "a message that originated in a Discord
+   * thread" (already visible there, no need to re-post) apart from "a
+   * user_message pushed by the IDE extension" (needs posting).
+   */
+  sendUserMessage(text: string, sessionId?: string, id?: string, attachments?: MessageAttachment[]): HubEvent {
+    const event = this.emitEvent({
+      type: 'user_message',
+      text,
+      sessionId,
+      id,
+      ...(attachments && attachments.length > 0 ? { attachments } : {}),
+    });
     this.onUserMessage?.(event);
     return event;
   }
@@ -115,6 +132,7 @@ export class Hub {
   /** Used by index.ts's periodic ~/.kiro/sessions scan. Purely a local cache now — nothing broadcasts it over the wire; Discord's /sessions command reads it via getLocalSessions(). */
   setLocalSessions(sessions: SessionSummary[]): void {
     this.localSessions = sessions;
+    this.onLocalSessions?.(sessions);
   }
 
   getLocalSessions(): SessionSummary[] {
@@ -131,6 +149,9 @@ export class Hub {
 
   /** Wired by discordBot.ts: fires whenever an approval_request is resolved, regardless of source (Discord buttons, or resolved directly in the IDE), so Discord can edit the original message to show the outcome. */
   onApprovalResolved: ((info: ApprovalResolvedInfo) => void) | null = null;
+
+  /** Wired by discordBot.ts: fires each time the periodic ~/.kiro/sessions scan refreshes local session metadata, so Discord can rename its threads to match the title Kiro (re)assigned to a session. */
+  onLocalSessions: ((sessions: SessionSummary[]) => void) | null = null;
 
   // --- connection handling (IDE extensions only) ---
 

@@ -1,5 +1,6 @@
+import { randomUUID } from 'crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
-import { dirname, join } from 'path';
+import { basename, dirname, join } from 'path';
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -16,7 +17,8 @@ import {
 } from 'discord.js';
 import type { AgentConfig } from './config';
 import type { Hub, ApprovalResolvedInfo } from './hub';
-import type { HubEvent, ToolApprovalDecision } from './hubProtocol';
+import type { HubEvent, MessageAttachment, ToolApprovalDecision } from './hubProtocol';
+import type { SessionSummary } from './sessionScanner';
 
 /** Discord hard-caps a single message at this many characters. */
 const DISCORD_MESSAGE_LIMIT = 2000;
@@ -82,6 +84,19 @@ export class DiscordBot {
    * for it.
    */
   private readonly pendingNewSessionThreads: string[] = [];
+  /**
+   * Event ids for user_message events *this bot itself* created by calling
+   * hub.sendUserMessage (i.e. the user typed into a Discord thread, or a
+   * forum post's starter message). Those are already visible in Discord as
+   * the user's own message, so handleHubEvent must not re-post them.
+   *
+   * A user_message can also arrive from the *IDE extension* (via
+   * push_event, when you type directly into the Kiro IDE chat panel) — that
+   * one is NOT in this set, and must be posted so the phone/Discord side
+   * sees what was typed in the IDE. Entries are removed once seen, since
+   * handleHubEvent only ever needs to check each event once.
+   */
+  private readonly ownMessageEventIds = new Set<string>();
 
   constructor(
     private readonly config: AgentConfig,
@@ -116,6 +131,7 @@ export class DiscordBot {
 
     this.hub.onEvent = (event) => void this.handleHubEvent(event);
     this.hub.onApprovalResolved = (info) => void this.handleApprovalResolved(info);
+    this.hub.onLocalSessions = () => void this.reconcileThreadTitles();
   }
 
   async start(): Promise<void> {
@@ -140,9 +156,19 @@ export class DiscordBot {
     if (sessionId === undefined) return; // a thread we don't recognize (e.g. created manually) — ignore
 
     const text = message.content.trim();
-    if (!text) return;
+    const attachments = extractImageAttachments(message);
+    // An image-only message (no caption) is still a valid prompt — don't
+    // drop it just because the text is empty.
+    if (!text && attachments.length === 0) return;
 
-    this.hub.sendUserMessage(text, sessionId === DEFAULT_SESSION_KEY ? undefined : sessionId);
+    const eventId = randomUUID();
+    this.ownMessageEventIds.add(eventId);
+    this.hub.sendUserMessage(
+      text,
+      sessionId === DEFAULT_SESSION_KEY ? undefined : sessionId,
+      eventId,
+      attachments,
+    );
   }
 
   private async handleButton(interaction: ButtonInteraction): Promise<void> {
@@ -177,10 +203,15 @@ export class DiscordBot {
     // handleApprovalResolved editing the original approval_request message
     // instead, so there's nothing additional to post for this type.
     if (event.type === 'approval_response') return;
-    // The daemon's own PTY session echoes back whatever text it was sent,
-    // and the message the user typed into the thread is already visible
-    // there — posting it again as a bot message would just double it.
-    if (event.type === 'user_message') return;
+    // A user_message this bot itself originated (typed into a Discord
+    // thread, or a forum post's starter message) is already visible there
+    // as the user's own message — posting it again would just double it.
+    // A user_message from the IDE extension (typed directly into the Kiro
+    // IDE chat panel) is NOT in this set and falls through to be posted,
+    // since that's the only way it reaches Discord at all.
+    if (event.type === 'user_message') {
+      if (this.ownMessageEventIds.delete(event.id)) return;
+    }
 
     // The extension's reply to a NEW_SESSION_SENTINEL request: not a
     // message to display, but the signal to map the waiting forum thread
@@ -290,14 +321,29 @@ export class DiscordBot {
 
     try {
       const starter = await thread.fetchStarterMessage().catch(() => null);
-      const text = starter?.content.trim();
-      if (!text) {
-        await thread.send('⚠️ Não encontrei nenhum texto na primeira mensagem deste post — envie o pedido inicial no corpo do post.');
+      // This event fires for every new thread in the forum, including ones
+      // this bot itself just created via getOrCreateThread — the gateway's
+      // ThreadCreate push can (and does) arrive before that REST call's own
+      // promise resolves in this process, so the `sessionIdForThread` check
+      // above can't be relied on alone to filter those out (see the
+      // getOrCreateThread doc comment). A thread's starter message author
+      // is a race-proof signal instead: only this bot ever posts a
+      // session's opening "Sessão local: ..."/"Chat padrão..." message, so
+      // any thread whose starter was written by it is never a real user
+      // request, regardless of timing.
+      if (starter?.author.id === this.client.user?.id) return;
+
+      const text = starter?.content.trim() ?? '';
+      const attachments = starter ? extractImageAttachments(starter) : [];
+      if (!text && attachments.length === 0) {
+        await thread.send('⚠️ Não encontrei texto nem imagem na primeira mensagem deste post — envie o pedido inicial (texto e/ou imagem) no corpo do post.');
         return;
       }
 
       this.pendingNewSessionThreads.push(thread.id);
-      this.hub.sendUserMessage(text, NEW_SESSION_SENTINEL);
+      const eventId = randomUUID();
+      this.ownMessageEventIds.add(eventId);
+      this.hub.sendUserMessage(text, NEW_SESSION_SENTINEL, eventId, attachments);
     } catch (err) {
       console.error('[discord] failed to handle new forum post:', err);
     }
@@ -317,6 +363,15 @@ export class DiscordBot {
 
   // --- thread <-> session mapping ---
 
+  /**
+   * Note: `this.threadMap[key]` is only set *after* `forum.threads.create`
+   * resolves below. The gateway's ThreadCreate event for that same thread
+   * can arrive in this process before that REST promise does (they're two
+   * independent round-trips), so handleThreadCreate briefly sees a thread
+   * this bot just created as "unrecognized". It doesn't misfire on that
+   * window because it filters by starter-message author instead of relying
+   * on the map being already updated — see its comment.
+   */
   private async getOrCreateThread(sessionId: string | undefined): Promise<ThreadChannel | null> {
     const key = sessionId ?? DEFAULT_SESSION_KEY;
     const existingId = this.threadMap[key];
@@ -332,7 +387,7 @@ export class DiscordBot {
       return null;
     }
 
-    const title = truncate(sessionTitle(sessionId, this.hub), DISCORD_TITLE_LIMIT);
+    const title = this.buildThreadTitle(sessionId);
     const created = await forum.threads.create({
       name: title,
       message: { content: sessionId ? `Sessão local: \`${sessionId}\`` : 'Chat padrão do agente.' },
@@ -368,6 +423,59 @@ export class DiscordBot {
     }
   }
 
+  // --- thread title <-> session title/workspace ---
+
+  /**
+   * Builds a thread title in the form `[workspace] título da sessão`, so a
+   * glance at Discord tells you both which project you're touching and what
+   * the session is about. The workspace prefix comes from the basename of
+   * the session's workspace path (or the daemon's KIRO_PROJECT_DIR for the
+   * default chat); the title is whatever Kiro assigned to the session — it
+   * starts out empty on a fresh session (falling back to a short id) and is
+   * later reconciled once Kiro auto-names it.
+   */
+  private buildThreadTitle(sessionId: string | undefined): string {
+    if (!sessionId) {
+      const prefix = basename(this.config.KIRO_PROJECT_DIR);
+      return composeTitle(prefix, 'Chat padrão');
+    }
+
+    const local = this.hub.getLocalSessions().find((s) => s.id === sessionId);
+    const prefix = workspaceLabel(local);
+    const base = local?.title?.trim() || `Sessão ${sessionId.slice(0, 8)}`;
+    return composeTitle(prefix, base);
+  }
+
+  /**
+   * Renames each mapped thread to match the title Kiro currently gives its
+   * session (which it auto-generates after the first turns, so the thread
+   * starts as "[workspace] Sessão abcd1234" and becomes
+   * "[workspace] <título real>" here). Runs on every ~/.kiro/sessions scan,
+   * but only calls Discord's rename API when the computed title actually
+   * changed — Discord rate-limits channel renames hard (roughly twice per
+   * ten minutes), so a no-op reconcile must not touch the network.
+   */
+  private async reconcileThreadTitles(): Promise<void> {
+    if (!this.ready) return;
+
+    for (const [key, threadId] of Object.entries(this.threadMap)) {
+      const sessionId = key === DEFAULT_SESSION_KEY ? undefined : key;
+      const desired = this.buildThreadTitle(sessionId);
+
+      const thread = await this.fetchThread(threadId);
+      if (!thread) continue;
+      if (thread.name === desired) continue;
+
+      try {
+        await thread.setName(desired);
+      } catch (err) {
+        // Rate limit, archived thread, or lost permissions — try again on
+        // the next scan rather than treating it as fatal.
+        console.error(`[discord] failed to rename thread ${threadId}:`, err);
+      }
+    }
+  }
+
   private loadThreadMap(): Record<string, string> {
     try {
       const raw = readFileSync(this.threadMapPath, 'utf8');
@@ -390,12 +498,40 @@ export class DiscordBot {
   }
 }
 
+// --- attachment helpers ---
+
+/** File extensions treated as images when Discord doesn't report a contentType. */
+const IMAGE_EXTENSION = /\.(png|jpe?g|gif|webp|bmp|heic|heif)$/i;
+
+/**
+ * Pulls image attachments off a Discord message. Discord usually populates
+ * `contentType` (e.g. "image/png"); when it doesn't, we fall back to the
+ * filename extension. Non-image attachments are ignored — Kiro's vision is
+ * what this feature is about, and other file types would just be noise in
+ * the prompt.
+ */
+function extractImageAttachments(message: Message): MessageAttachment[] {
+  const images: MessageAttachment[] = [];
+  for (const attachment of message.attachments.values()) {
+    const contentType = attachment.contentType ?? undefined;
+    const filename = attachment.name ?? 'image';
+    const looksLikeImage = contentType?.startsWith('image/') || IMAGE_EXTENSION.test(filename);
+    if (!looksLikeImage) continue;
+    images.push({ url: attachment.url, filename, contentType });
+  }
+  return images;
+}
+
 // --- formatting helpers ---
 
 function formatEventText(event: HubEvent): string | null {
   switch (event.type) {
     case 'assistant_message':
       return event.text;
+    case 'user_message':
+      // Only reached for a user_message that originated in the Kiro IDE
+      // (see handleHubEvent) — labeled so it doesn't read as a bot reply.
+      return `**Você (no Kiro IDE):** ${event.text}`;
     case 'thought':
       return `> 💭 _${event.text}_`;
     case 'status':
@@ -423,10 +559,28 @@ function describeDecision(decision: ToolApprovalDecision): string {
   }
 }
 
-function sessionTitle(sessionId: string | undefined, hub: Hub): string {
-  if (!sessionId) return 'Chat padrão';
-  const local = hub.getLocalSessions().find((s) => s.id === sessionId);
-  return local?.title || `Sessão ${sessionId.slice(0, 8)}`;
+/** Basename of a session's first workspace path, or empty when unknown (used as the thread-title prefix). */
+function workspaceLabel(session: SessionSummary | undefined): string {
+  const first = session?.workspacePaths?.[0];
+  return first ? basename(first) : '';
+}
+
+/**
+ * Joins a workspace prefix and a session title into `[prefix] title`,
+ * fitting within DISCORD_TITLE_LIMIT. The workspace prefix is preserved
+ * whole (it's the "where am I working" signal that matters most) and only
+ * the title is trimmed to fit; if the prefix alone would overflow, the
+ * prefix itself is truncated as a last resort.
+ */
+function composeTitle(prefix: string, title: string): string {
+  if (!prefix) return truncate(title, DISCORD_TITLE_LIMIT);
+
+  const wrapper = `[${prefix}] `;
+  if (wrapper.length >= DISCORD_TITLE_LIMIT) {
+    // Prefix alone doesn't fit — truncate the bracketed prefix and drop the title.
+    return truncate(`[${prefix}]`, DISCORD_TITLE_LIMIT);
+  }
+  return `${wrapper}${truncate(title, DISCORD_TITLE_LIMIT - wrapper.length)}`;
 }
 
 function truncate(text: string, maxLength: number): string {

@@ -4,6 +4,7 @@ import { Hub } from './hub';
 import { DiscordBot } from './discordBot';
 import { KiroSession } from './kiroSession';
 import { scanSessionSummaries } from './sessionScanner';
+import { composePromptWithImages, downloadAttachments } from './imageDownload';
 import type { HubEvent } from './hubProtocol';
 
 async function main() {
@@ -45,7 +46,26 @@ async function main() {
     // here would create a disconnected process that never shows up in the
     // IDE and loses its MCP context. Nothing to do here for those.
     if (event.sessionId) return;
-    session.sendMessage(event.text);
+
+    const attachments = event.attachments ?? [];
+    if (attachments.length === 0) {
+      session.sendMessage(event.text);
+      return;
+    }
+
+    // Images can't be "typed" into the kiro-cli TUI, so download them to
+    // local temp files and reference their absolute paths in the prompt —
+    // kiro-cli reads the images from disk with its own file tools. Done
+    // async so the PTY write happens only after the files exist; a failure
+    // still sends the text so the user isn't left with silence.
+    void downloadAttachments(attachments)
+      .then((paths) => {
+        session.sendMessage(composePromptWithImages(event.text, paths));
+      })
+      .catch((err) => {
+        logError('image download (default session)', err);
+        session.sendMessage(event.text);
+      });
   };
 
   hub.onApprovalResponse = (event: HubEvent) => {

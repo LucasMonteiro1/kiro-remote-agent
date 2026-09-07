@@ -19,6 +19,22 @@
 export type ToolApprovalDecision = 'approve' | 'deny' | 'approve_always';
 
 /**
+ * An image (or other file) attached to a user_message, as sent from
+ * Discord. Only the URL/filename/contentType travel over the wire — the
+ * actual bytes are downloaded on demand by whoever delivers the message
+ * (the daemon's PTY session or the IDE extension), saved to a local temp
+ * file, and referenced by absolute path in the prompt so kiro-cli / the
+ * Kiro IDE can read the image with its file tools. Discord attachment URLs
+ * are public but time-limited, which is why they're fetched promptly at
+ * delivery rather than kept around.
+ */
+export interface MessageAttachment {
+  url: string;
+  filename: string;
+  contentType?: string;
+}
+
+/**
  * Every event variant carries an optional `sessionId`. `undefined` means
  * the event belongs to the original "default" chat (the daemon's fixed
  * kiro-cli session, mapped to a persistent Discord thread). A concrete
@@ -26,7 +42,15 @@ export type ToolApprovalDecision = 'approve' | 'deny' | 'approve_always';
  * mapped to its own Discord thread.
  */
 export type HubEvent =
-  | { id: string; type: 'user_message'; text: string; createdAt: number; sessionId?: string }
+  | {
+      id: string;
+      type: 'user_message';
+      text: string;
+      createdAt: number;
+      sessionId?: string;
+      /** Image (or other file) attachments from Discord, delivered by absolute local path after download. */
+      attachments?: MessageAttachment[];
+    }
   | { id: string; type: 'assistant_message'; text: string; createdAt: number; sessionId?: string }
   | { id: string; type: 'thought'; text: string; createdAt: number; sessionId?: string }
   | {

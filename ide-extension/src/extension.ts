@@ -2,14 +2,17 @@ import * as vscode from 'vscode';
 import WebSocket from 'ws';
 import {
   closeSync,
+  mkdirSync,
   openSync,
   readFileSync,
   readSync,
   readdirSync,
   statSync,
+  writeFileSync,
 } from 'fs';
-import { homedir } from 'os';
-import { join } from 'path';
+import { homedir, tmpdir } from 'os';
+import { extname, join } from 'path';
+import { randomUUID } from 'crypto';
 
 /**
  * Kiro Remote Bridge
@@ -64,6 +67,12 @@ let hubSocket: HubSocket | undefined;
 let lastError: string | null = null;
 let deliveredCount = 0;
 
+interface MessageAttachment {
+  url: string;
+  filename: string;
+  contentType?: string;
+}
+
 interface HubEvent {
   id: string;
   type: string;
@@ -72,6 +81,7 @@ interface HubEvent {
   sessionId?: string;
   requestId?: string;
   decision?: string;
+  attachments?: MessageAttachment[];
 }
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -262,8 +272,9 @@ async function handleHubEvent(config: BridgeConfig, event: HubEvent): Promise<vo
   // any local IDE session — nothing here is ours to act on.
   if (!event.sessionId) return;
 
-  if (event.type === 'user_message' && event.text) {
-    await handleRemoteMessage(config, event.sessionId, event.text, event.id);
+  const attachments = event.attachments ?? [];
+  if (event.type === 'user_message' && (event.text || attachments.length > 0)) {
+    await handleRemoteMessage(config, event.sessionId, event.text ?? '', event.id, attachments);
   } else if (event.type === 'approval_response' && event.requestId && event.decision) {
     await handleRemoteApprovalResponse(config, event.sessionId, event.requestId, event.decision, event.id);
   }
@@ -303,6 +314,7 @@ async function handleRemoteMessage(
   sessionId: string,
   text: string,
   eventId: string,
+  attachments: MessageAttachment[] = [],
 ): Promise<void> {
   const isNew = sessionId === NEW_SESSION_SENTINEL;
 
@@ -343,10 +355,25 @@ async function handleRemoteMessage(
     // Start watching before prompting so no part of the answer is missed.
     watchSessionForReplies(config, targetSessionId);
 
-    markDelivered(targetSessionId, text);
-    await vscode.commands.executeCommand('kiroAgent.sessions.sendPrompt', targetSessionId, text);
+    // Images sent from Discord are downloaded to local temp files here and
+    // referenced by absolute path in the prompt, so the Kiro IDE reads them
+    // with its own file tools. A download failure just falls back to the
+    // text, so the user still gets a reply rather than silence.
+    let prompt = text;
+    if (attachments.length > 0) {
+      const imagePaths = await downloadAttachments(attachments);
+      if (imagePaths.length > 0) {
+        prompt = composePromptWithImages(text, imagePaths);
+        log(`Downloaded ${imagePaths.length} image(s) for ${shortId(targetSessionId)}`);
+      } else {
+        log(`No images could be downloaded for ${shortId(targetSessionId)}; sending text only.`);
+      }
+    }
+
+    markDelivered(targetSessionId, prompt);
+    await vscode.commands.executeCommand('kiroAgent.sessions.sendPrompt', targetSessionId, prompt);
     deliveredCount += 1;
-    log(`Delivered to ${shortId(targetSessionId)}: ${text.slice(0, 80)}`);
+    log(`Delivered to ${shortId(targetSessionId)}: ${prompt.slice(0, 80)}`);
 
     // sendPrompt only submits the turn through the ACP client — it doesn't
     // trigger the webview's "optimistic append" that draws the user's own
@@ -951,6 +978,61 @@ function readConfig(): BridgeConfig {
 
 function shortId(sessionId: string): string {
   return sessionId.length > 16 ? `${sessionId.slice(0, 16)}…` : sessionId;
+}
+
+// --- image attachments ---
+//
+// Kept self-contained here (rather than shared with the daemon's
+// src/imageDownload.ts) because this extension is a separate package that
+// bundles independently and can't import from the daemon's sources. The
+// logic mirrors that module: download each Discord attachment to a local
+// temp file and reference the absolute path in the prompt so the Kiro IDE
+// reads the image with its own file tools.
+
+const IMAGE_TMP_DIR = join(tmpdir(), 'kiro-remote-images');
+const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
+const KNOWN_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.heic', '.heif']);
+
+async function downloadAttachments(attachments: MessageAttachment[]): Promise<string[]> {
+  const results = await Promise.all(attachments.map((a) => downloadAttachment(a)));
+  return results.filter((path): path is string => path !== null);
+}
+
+async function downloadAttachment(attachment: MessageAttachment): Promise<string | null> {
+  try {
+    const response = await fetch(attachment.url);
+    if (!response.ok) return null;
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.byteLength === 0 || buffer.byteLength > MAX_IMAGE_BYTES) return null;
+    mkdirSync(IMAGE_TMP_DIR, { recursive: true });
+    const path = join(IMAGE_TMP_DIR, `${randomUUID()}${safeExtension(attachment.filename, attachment.contentType)}`);
+    writeFileSync(path, buffer);
+    return path;
+  } catch {
+    return null;
+  }
+}
+
+function safeExtension(filename: string, contentType?: string): string {
+  const ext = extname(filename).toLowerCase();
+  if (KNOWN_IMAGE_EXTENSIONS.has(ext)) return ext;
+  const subtype = contentType?.split('/')[1]?.toLowerCase();
+  if (subtype) {
+    const fromType = `.${subtype === 'jpeg' ? 'jpg' : subtype}`;
+    if (KNOWN_IMAGE_EXTENSIONS.has(fromType)) return fromType;
+  }
+  return '.png';
+}
+
+function composePromptWithImages(text: string, imagePaths: string[]): string {
+  if (imagePaths.length === 0) return text;
+  const lines = imagePaths.map((p) => `- ${p}`).join('\n');
+  const label =
+    imagePaths.length === 1
+      ? 'Imagem anexada (leia o arquivo local para analisá-la):'
+      : 'Imagens anexadas (leia os arquivos locais para analisá-las):';
+  const body = `${label}\n${lines}`;
+  return text ? `${text}\n\n${body}` : body;
 }
 
 function describeError(err: unknown): string {
