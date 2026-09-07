@@ -5,6 +5,7 @@ import { DiscordBot } from './discordBot';
 import { KiroSession } from './kiroSession';
 import { scanSessionSummaries } from './sessionScanner';
 import { composePromptWithImages, downloadAttachments } from './imageDownload';
+import { maybeCreateUpdater } from './updater';
 import type { HubEvent } from './hubProtocol';
 
 async function main() {
@@ -34,6 +35,19 @@ async function main() {
   session.start();
   hub.pushStatus(`Agente conectado em ${config.HOST_LABEL}.`);
   await discord.start();
+
+  // Self-updater: only active under the managed install layout (set by the
+  // installer's launchd/systemd unit via KIRO_REMOTE_MANAGED=1). During a
+  // maintainer's `yarn dev`/`yarn start` from the source repo it's a no-op,
+  // so this checkout never tries to update itself. Notifications ride the
+  // default session's status channel so they show up in the "Chat padrão"
+  // Discord thread.
+  const updater = maybeCreateUpdater(
+    config,
+    (text) => hub.pushStatus(text),
+    (context, err) => logError(context, err),
+  );
+  updater?.start();
 
   // Events for the daemon's own default chat arrive as direct hub
   // callbacks — no network hop, no polling, no delay.

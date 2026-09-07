@@ -43,6 +43,17 @@ const envSchema = z.object({
   DENY_KEYSTROKES: z.string().default('n\r'),
   APPROVE_ALWAYS_KEYSTROKES: z.string().default('a\r'),
 
+  // --- Auto-update (only active when running under the managed install layout) ---
+  /** Master switch for the self-updater. When false, the daemon never checks for or applies updates. */
+  AUTO_UPDATE: z
+    .string()
+    .default('true')
+    .transform((v) => v !== 'false' && v !== '0'),
+  /** How often (ms) to check the GitHub Releases API for a newer version. Default 1h. */
+  UPDATE_CHECK_INTERVAL_MS: z.coerce.number().int().positive().default(3600000),
+  /** owner/repo whose GitHub Releases the updater pulls from. Lets a fork point at its own canonical repo. */
+  UPDATE_REPO: z.string().default('LucasMonteiro1/kiro-remote-agent'),
+
   // --- Debug ---
   DEBUG_LOG_PATH: z.string().default('./kiro-remote-agent-debug.log'),
 });

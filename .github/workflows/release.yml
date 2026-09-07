@@ -1,0 +1,107 @@
+name: Release
+
+# Publishes a GitHub Release whenever a SemVer tag (vX.Y.Z) is pushed.
+# The release carries one daemon tarball per supported platform (each with
+# dist/ + production node_modules including node-pty's native prebuild for
+# that platform + the bundled extension .vsix) plus the standalone .vsix.
+# The install.sh installer and the daemon's self-updater both consume these
+# assets — see src/updater.ts for the exact asset-naming contract.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write # required to create the GitHub Release
+
+jobs:
+  # Build the extension once — it's a pure-Node esbuild bundle, identical
+  # across platforms, so there's no need to rebuild it in the daemon matrix.
+  build-extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Package extension
+        working-directory: ide-extension
+        run: |
+          yarn install --frozen-lockfile
+          npm pkg set version="${GITHUB_REF_NAME#v}"
+          yarn package
+          mv kiro-remote-bridge-*.vsix kiro-remote-bridge.vsix
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extension
+          path: ide-extension/kiro-remote-bridge.vsix
+
+  # Build one daemon tarball per platform. Running yarn install on each
+  # target runner is what pulls node-pty's correct native prebuild for that
+  # OS/arch, so the dev never needs build tools.
+  build-daemon:
+    needs: build-extension
+    strategy:
+      matrix:
+        include:
+          - os: macos-14 # Apple Silicon
+            target: darwin-arm64
+          - os: macos-13 # Intel
+            target: darwin-x64
+          - os: ubuntu-latest
+            target: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set version from tag
+        run: npm pkg set version="${GITHUB_REF_NAME#v}"
+
+      - name: Build daemon
+        run: |
+          yarn install --frozen-lockfile
+          yarn build
+
+      - name: Download extension .vsix
+        uses: actions/download-artifact@v4
+        with:
+          name: extension
+          path: .
+
+      - name: Assemble release tarball
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGE="stage/kiro-remote-agent"
+          mkdir -p "$STAGE"
+          # Production-only node_modules (brings node-pty's prebuild for this runner's platform).
+          cp package.json yarn.lock "$STAGE/"
+          ( cd "$STAGE" && yarn install --production --frozen-lockfile )
+          cp -R dist "$STAGE/dist"
+          cp .env.example "$STAGE/.env.example"
+          cp kiro-remote-bridge.vsix "$STAGE/kiro-remote-bridge.vsix"
+          tar -czf "kiro-remote-agent-${VERSION}-${{ matrix.target }}.tar.gz" -C stage kiro-remote-agent
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: daemon-${{ matrix.target }}
+          path: kiro-remote-agent-*.tar.gz
+
+  # Collect every artifact and attach them to the tag's GitHub Release.
+  release:
+    needs: build-daemon
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create/Update Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/daemon-*/kiro-remote-agent-*.tar.gz
+            artifacts/extension/kiro-remote-bridge.vsix
+          generate_release_notes: true

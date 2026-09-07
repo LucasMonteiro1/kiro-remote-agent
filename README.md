@@ -5,6 +5,79 @@ entre uma sessão interativa do `kiro-cli` e um bot do Discord — para você
 continuar a conversa pelo celular usando o próprio app do Discord, sem
 nenhuma infraestrutura própria (sem relay, sem túnel, sem banco de dados).
 
+## Instalação para devs (recomendado)
+
+Você **não precisa clonar este repositório**. A instalação é um comando só,
+que baixa o último release pronto, configura tudo e deixa o daemon rodando
+em segundo plano — inclusive se atualizando sozinho quando sair uma versão
+nova.
+
+### 1. Crie seu bot e servidor no Discord (uma vez)
+
+Cada dev usa o **seu próprio** bot e servidor Discord. Siga o passo a passo
+em [Setup do Discord](#setup-do-discord) abaixo — ao final você terá o
+`DISCORD_BOT_TOKEN` e o `DISCORD_FORUM_CHANNEL_ID`.
+
+### 2. Rode o instalador
+
+Pré-requisitos: **Node ≥ 20** e o **`kiro` CLI** no PATH (você já tem se usa
+o Kiro IDE).
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/LucasMonteiro1/kiro-remote-agent/main/install.sh | bash
+```
+
+O instalador (macOS e Linux):
+
+- baixa o release da sua plataforma para `~/.kiro-remote-agent/`;
+- pergunta `DISCORD_BOT_TOKEN`, `DISCORD_FORUM_CHANNEL_ID` e
+  `KIRO_PROJECT_DIR`, e **gera o `HUB_SHARED_SECRET` sozinho**;
+- instala a extensão **Kiro Remote Bridge** no Kiro IDE;
+- registra um serviço de boot (launchd no macOS / systemd no Linux) para o
+  daemon subir sozinho e reiniciar após atualizações.
+
+Depois, no `settings.json` do Kiro IDE, aponte a extensão para o mesmo
+segredo gerado (o instalador mostra o caminho do `.env`):
+
+```json
+{
+  "kiroRemoteBridge.enabled": true,
+  "kiroRemoteBridge.hubUrl": "ws://127.0.0.1:8787",
+  "kiroRemoteBridge.hubSecret": "o-valor-de-HUB_SHARED_SECRET-do-seu-.env"
+}
+```
+
+Recarregue a janela do Kiro (`Cmd/Ctrl+Shift+P` → **Developer: Reload
+Window**) e pronto — abra o Discord no celular e comece a conversar.
+
+### Atualizações (automáticas)
+
+O daemon verifica novas versões periodicamente e se atualiza sozinho —
+baixa o novo release, reinstala a extensão, e reinicia. Quando a extensão
+for atualizada, ele avisa no Discord para você recarregar a janela do Kiro.
+Nada a fazer manualmente.
+
+Para pausar as atualizações, coloque `AUTO_UPDATE=false` no seu
+`~/.kiro-remote-agent/.env` e reinicie o serviço.
+
+### Desinstalar
+
+```bash
+# macOS
+launchctl unload ~/Library/LaunchAgents/com.kiroremote.agent.plist
+rm ~/Library/LaunchAgents/com.kiroremote.agent.plist
+
+# Linux
+systemctl --user disable --now kiro-remote-agent.service
+rm ~/.config/systemd/user/kiro-remote-agent.service
+
+# ambos
+rm -rf ~/.kiro-remote-agent
+```
+
+> Instalação a partir do código-fonte (para quem quer contribuir com o
+> projeto) está descrita em [Setup do daemon](#setup-do-daemon) mais abaixo.
+
 ## Como funciona
 
 ```
