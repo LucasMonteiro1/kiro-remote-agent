@@ -63,8 +63,8 @@ const envSchema = z.object({
     .string()
     .default('true')
     .transform((v) => v !== 'false' && v !== '0'),
-  /** ggml model name bundled in the release, used to build the default model filename (ggml-<name>.bin). */
-  WHISPER_MODEL: z.string().default('base'),
+  /** ggml model name bundled in the release, used to build the default model filename (ggml-<name>.bin). "small" matches the faster-whisper MCP default and handles PT-BR voice notes much better than "base". */
+  WHISPER_MODEL: z.string().default('small'),
   /** Transcription language hint. "auto" lets whisper detect it; a concrete code (default "pt" for Brazilian Portuguese) forces one, which is faster and more accurate when the spoken language is known. */
   WHISPER_LANGUAGE: z.string().default('pt'),
   /** Worker threads for whisper-cli. 0 = let whisper pick its own default. */

@@ -60,9 +60,11 @@ jobs:
       # Pinned whisper.cpp build tag and ggml model bundled for local voice-
       # message transcription. Bumping WHISPER_CPP_REF here is all it takes to
       # ship a newer whisper.cpp; WHISPER_MODEL must match the daemon's
-      # WHISPER_MODEL default in src/config.ts (both are "base").
+      # WHISPER_MODEL default in src/config.ts (both are "small"). "small"
+      # mirrors the user's existing faster-whisper MCP default and is markedly
+      # more accurate than "base" on short Brazilian-Portuguese voice notes.
       WHISPER_CPP_REF: b4938
-      WHISPER_MODEL: base
+      WHISPER_MODEL: small
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
