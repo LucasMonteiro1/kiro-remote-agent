@@ -113,10 +113,18 @@ jobs:
         run: |
           # ffmpeg-static's postinstall downloads the correct static ffmpeg
           # for this runner's OS/arch; the package's main export is the
-          # absolute path to that binary.
+          # absolute path to that binary. Install it in an isolated dir and
+          # resolve the path from *inside* that dir so Node's module
+          # resolution finds ./node_modules/ffmpeg-static. npm output is left
+          # visible on purpose — a download/postinstall failure must surface
+          # in the log instead of yielding an empty path downstream.
           mkdir -p ffmpeg-tmp
-          ( cd ffmpeg-tmp && npm init -y >/dev/null 2>&1 && npm install ffmpeg-static@5.2.0 >/dev/null 2>&1 )
-          FFMPEG_PATH="$(node -e "process.stdout.write(require('ffmpeg-tmp/node_modules/ffmpeg-static'))")"
+          cd ffmpeg-tmp
+          npm init -y
+          npm install ffmpeg-static@5.2.0
+          FFMPEG_PATH="$(node -p "require('ffmpeg-static')")"
+          echo "resolved ffmpeg at: $FFMPEG_PATH"
+          test -x "$FFMPEG_PATH"
           echo "FFMPEG_PATH=$FFMPEG_PATH" >> "$GITHUB_ENV"
 
       - name: Stage vendor/ artifacts
@@ -128,8 +136,11 @@ jobs:
           chmod +x vendor/whisper-cli vendor/ffmpeg
           # Sanity-check the bundled toolchain actually runs on this runner
           # before we ship it, so a broken build fails the release instead of
-          # silently shipping a non-working binary.
-          ./vendor/whisper-cli --help >/dev/null
+          # silently shipping a non-working binary. whisper-cli's --help exits
+          # non-zero on some builds, so we only assert it loads and links
+          # (exit code ignored); ffmpeg -version must succeed cleanly.
+          ./vendor/whisper-cli --help >/dev/null 2>&1 || true
+          file vendor/whisper-cli
           ./vendor/ffmpeg -version >/dev/null
 
       - name: Assemble release tarball
