@@ -21,8 +21,8 @@ jobs:
   build-extension:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           # Node 22: @vscode/vsce pulls @azure/identity, which requires
           # Node >=22. This only affects the machine that *packages* the
@@ -36,7 +36,7 @@ jobs:
           npm pkg set version="${GITHUB_REF_NAME#v}"
           yarn package
           mv kiro-remote-bridge-*.vsix kiro-remote-bridge.vsix
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: extension
           path: ide-extension/kiro-remote-bridge.vsix
@@ -49,14 +49,14 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: macos-14 # Apple Silicon
+          - os: macos-26 # Apple Silicon (macOS Tahoe)
             target: darwin-arm64
           - os: ubuntu-latest
             target: linux-x64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 20
 
@@ -69,7 +69,7 @@ jobs:
           yarn build
 
       - name: Download extension .vsix
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: extension
           path: .
@@ -87,7 +87,7 @@ jobs:
           cp kiro-remote-bridge.vsix "$STAGE/kiro-remote-bridge.vsix"
           tar -czf "kiro-remote-agent-${VERSION}-${{ matrix.target }}.tar.gz" -C stage kiro-remote-agent
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: daemon-${{ matrix.target }}
           path: kiro-remote-agent-*.tar.gz
@@ -97,11 +97,11 @@ jobs:
     needs: build-daemon
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: artifacts
       - name: Create/Update Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v2.6.1
         with:
           files: |
             artifacts/daemon-*/kiro-remote-agent-*.tar.gz
