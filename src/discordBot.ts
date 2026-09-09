@@ -98,6 +98,18 @@ export class DiscordBot {
    * handleHubEvent only ever needs to check each event once.
    */
   private readonly ownMessageEventIds = new Set<string>();
+  /**
+   * Per-thread "está digitando..." keep-alive. Discord's typing indicator
+   * lasts only ~10s per `sendTyping()` call and there's no explicit "stop"
+   * API — it just fades once you stop refreshing it (or the moment you post
+   * a message). While a session is churning through thoughts/tool calls
+   * (which can span many seconds with no visible message), we re-send the
+   * indicator on an interval so the phone shows a live "processing" cue,
+   * then clear the interval once the turn produces a terminal event
+   * (assistant reply, error, or an approval prompt that now needs the
+   * user). Keyed by thread id; value is the refresh interval handle.
+   */
+  private readonly typingTimers = new Map<string, NodeJS.Timeout>();
 
   constructor(
     private readonly config: AgentConfig,
@@ -140,6 +152,8 @@ export class DiscordBot {
   }
 
   async stop(): Promise<void> {
+    for (const timer of this.typingTimers.values()) clearInterval(timer);
+    this.typingTimers.clear();
     await this.client.destroy();
   }
 
@@ -170,6 +184,11 @@ export class DiscordBot {
 
     const eventId = randomUUID();
     this.ownMessageEventIds.add(eventId);
+    // Light the typing cue the instant we forward the prompt, so there's
+    // immediate feedback even before the session emits its first thought /
+    // tool call. The interval then keeps it alive until a terminal event
+    // arrives; if the session somehow produces nothing, it just fades.
+    if (channel.isThread()) this.startTyping(channel);
     this.hub.sendUserMessage(
       prompt,
       sessionId === DEFAULT_SESSION_KEY ? undefined : sessionId,
@@ -278,6 +297,7 @@ export class DiscordBot {
     // literal sentinel string.
     if (event.sessionId === NEW_SESSION_SENTINEL) {
       const threadId = this.pendingNewSessionThreads.shift();
+      if (threadId) this.stopTyping(threadId); // session creation failed — drop the "processing" cue we lit on post creation
       const thread = threadId ? await this.fetchThread(threadId) : null;
       const text = formatEventText(event);
       if (thread && text) await thread.send(text).catch(() => {});
@@ -288,7 +308,21 @@ export class DiscordBot {
       const thread = await this.getOrCreateThread(event.sessionId);
       if (!thread) return;
 
+      // Keep a live "está digitando..." cue while the session is working.
+      // Intermediate activity (thoughts, tool calls, progress status) turns
+      // it on / keeps it alive; a terminal event for the turn (final reply,
+      // error, or an approval that now waits on the user) turns it off. The
+      // final assistant_message posting right after this already clears the
+      // indicator instantly, so stopping here just prevents the interval
+      // from re-lighting it afterwards.
+      if (event.type === 'thought' || event.type === 'tool_call' || event.type === 'status') {
+        this.startTyping(thread);
+      } else if (event.type === 'assistant_message' || event.type === 'error') {
+        this.stopTyping(thread.id);
+      }
+
       if (event.type === 'approval_request') {
+        this.stopTyping(thread.id);
         await this.postApprovalRequest(thread, event.id, event.promptText, event.toolName);
         return;
       }
@@ -401,6 +435,13 @@ export class DiscordBot {
       this.pendingNewSessionThreads.push(thread.id);
       const eventId = randomUUID();
       this.ownMessageEventIds.add(eventId);
+      // Light the typing cue right away: creating the IDE session plus its
+      // first turn can take a while before any activity event lands, and
+      // this thread isn't in the map yet — but startTyping works off the
+      // ThreadChannel directly, and the later terminal event resolves the
+      // same thread by id (mapped meanwhile in handleNewSessionCreated) to
+      // stop it, so the ids line up.
+      this.startTyping(thread);
       this.hub.sendUserMessage(prompt, NEW_SESSION_SENTINEL, eventId, images);
     } catch (err) {
       console.error('[discord] failed to handle new forum post:', err);
@@ -472,6 +513,35 @@ export class DiscordBot {
       if (id === threadId) return key;
     }
     return undefined;
+  }
+
+  // --- typing indicator keep-alive ---
+
+  /**
+   * Starts (or refreshes) the "está digitando..." indicator for a thread
+   * and keeps it alive until stopTyping is called. A single `sendTyping()`
+   * only lasts ~10s, so we fire one immediately and then re-fire every ~8s
+   * (comfortably inside that window) until the turn ends. Calling this
+   * again while already active just resets the timer, so a steady stream of
+   * activity events keeps the indicator continuously lit.
+   */
+  private startTyping(thread: ThreadChannel): void {
+    void thread.sendTyping().catch(() => {});
+    if (this.typingTimers.has(thread.id)) return; // already refreshing on interval
+    const timer = setInterval(() => {
+      void thread.sendTyping().catch(() => {});
+    }, 8000);
+    // Don't let this timer keep the process alive on its own.
+    timer.unref?.();
+    this.typingTimers.set(thread.id, timer);
+  }
+
+  /** Stops the typing keep-alive for a thread; the indicator fades on its own within a few seconds (and instantly once a real message posts). */
+  private stopTyping(threadId: string): void {
+    const timer = this.typingTimers.get(threadId);
+    if (!timer) return;
+    clearInterval(timer);
+    this.typingTimers.delete(threadId);
   }
 
   private async sendChunked(thread: ThreadChannel, text: string): Promise<void> {
