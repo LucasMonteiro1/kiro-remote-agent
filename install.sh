@@ -38,11 +38,15 @@ detect_target() {
     x86_64|amd64)  arch="x64" ;;
     *) die "Arquitetura não suportada: $(uname -m)." ;;
   esac
-  # Linux arm64 isn't built by CI yet; fail clearly rather than 404 later.
-  if [ "$os" = "linux" ] && [ "$arch" = "arm64" ]; then
-    die "linux-arm64 ainda não tem build publicado. Plataformas: darwin-arm64, darwin-x64, linux-x64."
-  fi
-  echo "${os}-${arch}"
+  # Only the platforms the CI publishes an asset for are supported; fail
+  # clearly here rather than 404ing on the download later. Mac Intel
+  # (darwin-x64) and Linux arm64 are intentionally not built.
+  local target="${os}-${arch}"
+  case "$target" in
+    darwin-arm64|linux-x64) ;;
+    *) die "Plataforma não suportada: $target. Suportadas: darwin-arm64 (Apple Silicon), linux-x64." ;;
+  esac
+  echo "$target"
 }
 
 require() { command -v "$1" >/dev/null 2>&1 || die "'$1' é necessário e não está no PATH."; }
