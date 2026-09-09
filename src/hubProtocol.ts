@@ -85,8 +85,6 @@ export type HubEvent =
       sessionId?: string;
     };
 
-export type HubEventType = HubEvent['type'];
-
 // --- Extension -> Hub ---
 
 export type ClientToHub =

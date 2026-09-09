@@ -250,8 +250,6 @@ class HubSocket {
     });
   }
 
-  /** Sends a request_session_detail and resolves with the result (or rejects on error/timeout). Not currently used by this extension — session detail requests are answered directly by the daemon — kept for completeness/future use. */
-
   close(): void {
     this.closed = true;
     this.ws?.close();

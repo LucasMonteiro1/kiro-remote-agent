@@ -18,7 +18,7 @@ const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
  * the original extension) so two images named "image.png" can't clobber each
  * other, and so a hostile filename can't traverse out of the temp dir.
  */
-export async function downloadAttachment(attachment: MessageAttachment): Promise<string | null> {
+async function downloadAttachment(attachment: MessageAttachment): Promise<string | null> {
   try {
     const response = await fetch(attachment.url);
     if (!response.ok) return null;

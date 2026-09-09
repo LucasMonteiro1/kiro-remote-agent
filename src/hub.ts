@@ -62,10 +62,6 @@ export class Hub {
     this.wss.close();
   }
 
-  isAnyExtensionConnected(): boolean {
-    return this.connections.size > 0;
-  }
-
   // --- called by Discord (the new "owner") ---
 
   /**
