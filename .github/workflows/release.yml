@@ -24,7 +24,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # Node 22: @vscode/vsce pulls @azure/identity, which requires
+          # Node >=22. This only affects the machine that *packages* the
+          # .vsix — the extension itself is a plain esbuild bundle, so the
+          # published artifact and the devs' runtime are unaffected.
+          node-version: 22
       - name: Package extension
         working-directory: ide-extension
         run: |
