@@ -19,6 +19,7 @@ import type { AgentConfig } from './config';
 import type { Hub, ApprovalResolvedInfo } from './hub';
 import type { HubEvent, MessageAttachment, ToolApprovalDecision } from './hubProtocol';
 import type { SessionSummary } from './sessionScanner';
+import { isAudioAttachment, transcribeAudioAttachments, unavailableReason } from './audioTranscribe';
 
 /** Discord hard-caps a single message at this many characters. */
 const DISCORD_MESSAGE_LIMIT = 2000;
@@ -156,19 +157,69 @@ export class DiscordBot {
     if (sessionId === undefined) return; // a thread we don't recognize (e.g. created manually) — ignore
 
     const text = message.content.trim();
-    const attachments = extractImageAttachments(message);
-    // An image-only message (no caption) is still a valid prompt — don't
-    // drop it just because the text is empty.
-    if (!text && attachments.length === 0) return;
+    const { images, audios } = splitAttachments(message);
+    // An image-only or audio-only message (no caption) is still a valid
+    // prompt — don't drop it just because the text is empty.
+    if (!text && images.length === 0 && audios.length === 0) return;
+
+    const prompt = await this.buildPromptWithAudio(channel, text, audios);
+    // If the whole message was an unusable voice note (nothing to
+    // transcribe, no caption, no image), buildPromptWithAudio already
+    // explained why in-thread; don't forward an empty prompt.
+    if (!prompt && images.length === 0) return;
 
     const eventId = randomUUID();
     this.ownMessageEventIds.add(eventId);
     this.hub.sendUserMessage(
-      text,
+      prompt,
       sessionId === DEFAULT_SESSION_KEY ? undefined : sessionId,
       eventId,
-      attachments,
+      images,
     );
+  }
+
+  /**
+   * Turns any audio attachments into text and folds it into the prompt,
+   * leaving images to travel on as attachments as before. Voice notes are
+   * transcribed locally (bundled whisper.cpp) into text here at the entry
+   * point, so everything downstream — the daemon's default kiro-cli session
+   * and the IDE extension alike — only ever sees a plain text prompt and
+   * neither needs to know audio exists. The transcript is echoed back into
+   * the thread so you can see what was understood. Returns the (possibly
+   * augmented) prompt text.
+   */
+  private async buildPromptWithAudio(
+    thread: ThreadChannel,
+    text: string,
+    audios: MessageAttachment[],
+  ): Promise<string> {
+    if (audios.length === 0) return text;
+
+    const reason = unavailableReason(this.config);
+    if (reason) {
+      // Can't transcribe on this install — tell the user once, in-thread,
+      // rather than silently swallowing their voice note.
+      await thread.send(`⚠️ ${reason}`).catch(() => {});
+      return text;
+    }
+
+    let transcript = '';
+    try {
+      transcript = await transcribeAudioAttachments(this.config, audios);
+    } catch (err) {
+      console.error('[discord] audio transcription failed:', err);
+    }
+
+    if (!transcript) {
+      await thread.send('⚠️ Não consegui transcrever o áudio enviado.').catch(() => {});
+      return text;
+    }
+
+    // Echo the transcript so the user can confirm it was understood
+    // correctly (and correct it in a follow-up if not).
+    await this.sendChunked(thread, `🎤 _Transcrição do áudio:_\n> ${transcript.replace(/\n/g, '\n> ')}`);
+
+    return text ? `${text}\n\n${transcript}` : transcript;
   }
 
   private async handleButton(interaction: ButtonInteraction): Promise<void> {
@@ -334,16 +385,23 @@ export class DiscordBot {
       if (starter?.author.id === this.client.user?.id) return;
 
       const text = starter?.content.trim() ?? '';
-      const attachments = starter ? extractImageAttachments(starter) : [];
-      if (!text && attachments.length === 0) {
-        await thread.send('⚠️ Não encontrei texto nem imagem na primeira mensagem deste post — envie o pedido inicial (texto e/ou imagem) no corpo do post.');
+      const { images, audios } = starter ? splitAttachments(starter) : { images: [], audios: [] };
+      if (!text && images.length === 0 && audios.length === 0) {
+        await thread.send('⚠️ Não encontrei texto, imagem nem áudio na primeira mensagem deste post — envie o pedido inicial (texto, imagem e/ou áudio) no corpo do post.');
+        return;
+      }
+
+      const prompt = await this.buildPromptWithAudio(thread, text, audios);
+      if (!prompt && images.length === 0) {
+        // The opening message was an untranscribable voice note with no
+        // caption/image; buildPromptWithAudio already said why in-thread.
         return;
       }
 
       this.pendingNewSessionThreads.push(thread.id);
       const eventId = randomUUID();
       this.ownMessageEventIds.add(eventId);
-      this.hub.sendUserMessage(text, NEW_SESSION_SENTINEL, eventId, attachments);
+      this.hub.sendUserMessage(prompt, NEW_SESSION_SENTINEL, eventId, images);
     } catch (err) {
       console.error('[discord] failed to handle new forum post:', err);
     }
@@ -504,22 +562,31 @@ export class DiscordBot {
 const IMAGE_EXTENSION = /\.(png|jpe?g|gif|webp|bmp|heic|heif)$/i;
 
 /**
- * Pulls image attachments off a Discord message. Discord usually populates
- * `contentType` (e.g. "image/png"); when it doesn't, we fall back to the
- * filename extension. Non-image attachments are ignored — Kiro's vision is
- * what this feature is about, and other file types would just be noise in
- * the prompt.
+ * Splits a Discord message's attachments into the two kinds this bot
+ * handles: images (which travel on to Kiro as attachments, read by its
+ * vision tools) and audio (voice notes / audio files, which are transcribed
+ * to text at the entry point and never leave this process as attachments).
+ * Anything that's neither is ignored — other file types would just be noise
+ * in the prompt.
+ *
+ * Discord usually populates `contentType` (e.g. "image/png", "audio/ogg");
+ * when it doesn't, we fall back to the filename extension for each kind.
  */
-function extractImageAttachments(message: Message): MessageAttachment[] {
+function splitAttachments(message: Message): { images: MessageAttachment[]; audios: MessageAttachment[] } {
   const images: MessageAttachment[] = [];
+  const audios: MessageAttachment[] = [];
   for (const attachment of message.attachments.values()) {
     const contentType = attachment.contentType ?? undefined;
-    const filename = attachment.name ?? 'image';
-    const looksLikeImage = contentType?.startsWith('image/') || IMAGE_EXTENSION.test(filename);
-    if (!looksLikeImage) continue;
-    images.push({ url: attachment.url, filename, contentType });
+    const filename = attachment.name ?? 'file';
+    const entry: MessageAttachment = { url: attachment.url, filename, contentType };
+
+    if (contentType?.startsWith('image/') || IMAGE_EXTENSION.test(filename)) {
+      images.push(entry);
+    } else if (isAudioAttachment(entry)) {
+      audios.push(entry);
+    }
   }
-  return images;
+  return { images, audios };
 }
 
 // --- formatting helpers ---

@@ -54,6 +54,30 @@ const envSchema = z.object({
   /** owner/repo whose GitHub Releases the updater pulls from. Lets a fork point at its own canonical repo. */
   UPDATE_REPO: z.string().default('LucasMonteiro1/kiro-remote-agent'),
 
+  // --- Audio transcription (local, via bundled whisper.cpp + ffmpeg) ---
+  // All of these default to "on with sensible values", and the binaries/model
+  // ship inside the release tarball (see release.yml), so a dev who
+  // auto-updates gets voice-message transcription with zero .env changes.
+  /** Master switch. When false, audio attachments are ignored instead of transcribed. */
+  TRANSCRIBE_ENABLED: z
+    .string()
+    .default('true')
+    .transform((v) => v !== 'false' && v !== '0'),
+  /** ggml model name bundled in the release, used to build the default model filename (ggml-<name>.bin). */
+  WHISPER_MODEL: z.string().default('base'),
+  /** Transcription language hint. "auto" lets whisper detect it; a concrete code (default "pt" for Brazilian Portuguese) forces one, which is faster and more accurate when the spoken language is known. */
+  WHISPER_LANGUAGE: z.string().default('pt'),
+  /** Worker threads for whisper-cli. 0 = let whisper pick its own default. */
+  WHISPER_THREADS: z.coerce.number().int().nonnegative().default(0),
+  /** Override the directory holding the bundled whisper-cli/ffmpeg/model. Defaults to `<release>/vendor`. */
+  TRANSCRIBE_VENDOR_DIR: z.string().optional(),
+  /** Explicit path to the whisper-cli binary (overrides the vendor-dir default). */
+  WHISPER_BIN: z.string().optional(),
+  /** Explicit path to the ffmpeg binary (overrides the vendor-dir default). */
+  FFMPEG_BIN: z.string().optional(),
+  /** Explicit path to the ggml model file (overrides the vendor-dir + WHISPER_MODEL default). */
+  WHISPER_MODEL_PATH: z.string().optional(),
+
   // --- Debug ---
   DEBUG_LOG_PATH: z.string().default('./kiro-remote-agent-debug.log'),
 });

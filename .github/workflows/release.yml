@@ -3,8 +3,10 @@ name: Release
 # Publishes a GitHub Release whenever a SemVer tag (vX.Y.Z) is pushed.
 # The release carries one daemon tarball per supported platform (each with
 # dist/ + production node_modules including node-pty's native prebuild for
-# that platform + the bundled extension .vsix) plus the standalone .vsix.
-# The install.sh installer and the daemon's self-updater both consume these
+# that platform + a vendor/ dir holding the local voice-transcription
+# toolchain: a statically-linked whisper-cli, a static ffmpeg, and the ggml
+# model + the bundled extension .vsix) plus the standalone .vsix. The
+# install.sh installer and the daemon's self-updater both consume these
 # assets — see src/updater.ts for the exact asset-naming contract.
 
 on:
@@ -54,6 +56,13 @@ jobs:
           - os: ubuntu-latest
             target: linux-x64
     runs-on: ${{ matrix.os }}
+    env:
+      # Pinned whisper.cpp build tag and ggml model bundled for local voice-
+      # message transcription. Bumping WHISPER_CPP_REF here is all it takes to
+      # ship a newer whisper.cpp; WHISPER_MODEL must match the daemon's
+      # WHISPER_MODEL default in src/config.ts (both are "base").
+      WHISPER_CPP_REF: b4938
+      WHISPER_MODEL: base
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -74,6 +83,55 @@ jobs:
           name: extension
           path: .
 
+      # --- Bundle the local-transcription toolchain (whisper.cpp + ffmpeg + model) ---
+      # These three artifacts ship inside the tarball under vendor/, so a dev
+      # who auto-updates gets voice-message transcription with zero setup: no
+      # system ffmpeg, no model download, no build tools on their machine.
+      # Built/fetched per-platform here on the matching runner, exactly like
+      # node-pty's native prebuild.
+
+      - name: Build whisper.cpp (whisper-cli, static)
+        run: |
+          git clone --depth 1 --branch "$WHISPER_CPP_REF" https://github.com/ggml-org/whisper.cpp whisper-src
+          # Static libs (-DBUILD_SHARED_LIBS=OFF) link ggml/whisper straight
+          # into whisper-cli, so the shipped binary is a single relocatable
+          # file with no loose .so/.dylib to find on the dev's machine.
+          cmake -S whisper-src -B whisper-src/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_EXAMPLES=ON
+          cmake --build whisper-src/build --config Release --target whisper-cli -j
+
+      - name: Fetch ggml model
+        run: |
+          # whisper.cpp ships a helper that downloads the ggml model into
+          # its models/ dir; grab the one matching the daemon's default.
+          ( cd whisper-src && bash ./models/download-ggml-model.sh "$WHISPER_MODEL" )
+
+      - name: Resolve static ffmpeg binary
+        run: |
+          # ffmpeg-static's postinstall downloads the correct static ffmpeg
+          # for this runner's OS/arch; the package's main export is the
+          # absolute path to that binary.
+          mkdir -p ffmpeg-tmp
+          ( cd ffmpeg-tmp && npm init -y >/dev/null 2>&1 && npm install ffmpeg-static@5.2.0 >/dev/null 2>&1 )
+          FFMPEG_PATH="$(node -e "process.stdout.write(require('ffmpeg-tmp/node_modules/ffmpeg-static'))")"
+          echo "FFMPEG_PATH=$FFMPEG_PATH" >> "$GITHUB_ENV"
+
+      - name: Stage vendor/ artifacts
+        run: |
+          mkdir -p vendor
+          cp whisper-src/build/bin/whisper-cli vendor/whisper-cli
+          cp "whisper-src/models/ggml-${WHISPER_MODEL}.bin" "vendor/ggml-${WHISPER_MODEL}.bin"
+          cp "$FFMPEG_PATH" vendor/ffmpeg
+          chmod +x vendor/whisper-cli vendor/ffmpeg
+          # Sanity-check the bundled toolchain actually runs on this runner
+          # before we ship it, so a broken build fails the release instead of
+          # silently shipping a non-working binary.
+          ./vendor/whisper-cli --help >/dev/null
+          ./vendor/ffmpeg -version >/dev/null
+
       - name: Assemble release tarball
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
@@ -83,6 +141,7 @@ jobs:
           cp package.json yarn.lock "$STAGE/"
           ( cd "$STAGE" && yarn install --production --frozen-lockfile )
           cp -R dist "$STAGE/dist"
+          cp -R vendor "$STAGE/vendor"
           cp .env.example "$STAGE/.env.example"
           cp kiro-remote-bridge.vsix "$STAGE/kiro-remote-bridge.vsix"
           tar -czf "kiro-remote-agent-${VERSION}-${{ matrix.target }}.tar.gz" -C stage kiro-remote-agent
