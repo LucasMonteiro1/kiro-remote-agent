@@ -104,12 +104,24 @@ export class DiscordBot {
    * API — it just fades once you stop refreshing it (or the moment you post
    * a message). While a session is churning through thoughts/tool calls
    * (which can span many seconds with no visible message), we re-send the
-   * indicator on an interval so the phone shows a live "processing" cue,
-   * then clear the interval once the turn produces a terminal event
-   * (assistant reply, error, or an approval prompt that now needs the
-   * user). Keyed by thread id; value is the refresh interval handle.
+   * indicator on an interval so the phone shows a live "processing" cue.
+   *
+   * A terminal event (assistant reply, error, or an approval that now needs
+   * the user) stops it explicitly — but we must NOT rely on that alone: a
+   * turn can end on a plain activity event (e.g. a final tool_call or a
+   * "turn complete" status) with no terminal event ever arriving, which
+   * would leave the interval firing sendTyping() forever — the phantom
+   * "escrevendo" with no session actually running. So each entry also
+   * carries an `expiresAt` deadline that every activity event pushes
+   * forward; the refresh loop stops itself once that deadline passes,
+   * guaranteeing the indicator fades on its own shortly after activity
+   * genuinely stops, regardless of whether a terminal event showed up.
    */
-  private readonly typingTimers = new Map<string, NodeJS.Timeout>();
+  private readonly typingTimers = new Map<string, { timer: NodeJS.Timeout; expiresAt: number }>();
+  /** How long after the last activity event the typing keep-alive self-expires, in ms. Kept a little above the 8s refresh cadence so a steadily-working session never flickers, but short enough that a turn ending silently clears within a few seconds. */
+  private static readonly TYPING_MAX_IDLE_MS = 12_000;
+  /** Refresh cadence for re-sending the indicator; must stay under Discord's ~10s typing lifetime. */
+  private static readonly TYPING_REFRESH_MS = 8_000;
 
   constructor(
     private readonly config: AgentConfig,
@@ -152,7 +164,7 @@ export class DiscordBot {
   }
 
   async stop(): Promise<void> {
-    for (const timer of this.typingTimers.values()) clearInterval(timer);
+    for (const entry of this.typingTimers.values()) clearInterval(entry.timer);
     this.typingTimers.clear();
     await this.client.destroy();
   }
@@ -518,29 +530,48 @@ export class DiscordBot {
   // --- typing indicator keep-alive ---
 
   /**
-   * Starts (or refreshes) the "está digitando..." indicator for a thread
-   * and keeps it alive until stopTyping is called. A single `sendTyping()`
-   * only lasts ~10s, so we fire one immediately and then re-fire every ~8s
-   * (comfortably inside that window) until the turn ends. Calling this
-   * again while already active just resets the timer, so a steady stream of
-   * activity events keeps the indicator continuously lit.
+   * Starts (or refreshes) the "está digitando..." indicator for a thread.
+   * Fires one `sendTyping()` immediately and pushes the self-expiry
+   * deadline out to now + TYPING_MAX_IDLE_MS. A single sendTyping() only
+   * lasts ~10s, so a refresh loop re-fires every TYPING_REFRESH_MS while
+   * activity keeps arriving.
+   *
+   * Crucially, the loop is self-terminating: on each tick it checks the
+   * deadline, and once no activity event has pushed it forward within the
+   * idle window it stops itself and lets the indicator fade. That's what
+   * prevents a turn that ends without a terminal event from leaving a
+   * forever-"escrevendo" cue. Calling this again just re-arms the deadline,
+   * so a steadily-working session stays continuously lit.
    */
   private startTyping(thread: ThreadChannel): void {
     void thread.sendTyping().catch(() => {});
-    if (this.typingTimers.has(thread.id)) return; // already refreshing on interval
-    const timer = setInterval(() => {
+
+    const existing = this.typingTimers.get(thread.id);
+    if (existing) {
+      existing.expiresAt = Date.now() + DiscordBot.TYPING_MAX_IDLE_MS;
+      return; // loop already running; just extended its deadline
+    }
+
+    const entry = { timer: null as unknown as NodeJS.Timeout, expiresAt: Date.now() + DiscordBot.TYPING_MAX_IDLE_MS };
+    entry.timer = setInterval(() => {
+      // Self-expire if activity has gone quiet — the safety net for turns
+      // that never emit a terminal event.
+      if (Date.now() >= entry.expiresAt) {
+        this.stopTyping(thread.id);
+        return;
+      }
       void thread.sendTyping().catch(() => {});
-    }, 8000);
+    }, DiscordBot.TYPING_REFRESH_MS);
     // Don't let this timer keep the process alive on its own.
-    timer.unref?.();
-    this.typingTimers.set(thread.id, timer);
+    entry.timer.unref?.();
+    this.typingTimers.set(thread.id, entry);
   }
 
   /** Stops the typing keep-alive for a thread; the indicator fades on its own within a few seconds (and instantly once a real message posts). */
   private stopTyping(threadId: string): void {
-    const timer = this.typingTimers.get(threadId);
-    if (!timer) return;
-    clearInterval(timer);
+    const entry = this.typingTimers.get(threadId);
+    if (!entry) return;
+    clearInterval(entry.timer);
     this.typingTimers.delete(threadId);
   }
 
