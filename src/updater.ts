@@ -125,7 +125,13 @@ export class Updater {
       await downloadTo(tarballUrl, tmpTar);
       // Tar is present on macOS and Linux and handles gzip via -z, so we
       // avoid pulling an npm tar dependency into the bundle.
-      await execFileAsync('tar', ['-xzf', tmpTar, '-C', targetDir]);
+      // --strip-components=1 drops the tarball's top-level kiro-remote-agent/
+      // dir so dist/, vendor/, etc. land directly in targetDir — matching
+      // where the validation below (and install.sh) expect them. Without it
+      // everything extracted under targetDir/kiro-remote-agent/, the
+      // dist/index.js check failed, and every hourly attempt rolled back
+      // after re-downloading the whole (nowadays ~250MB) tarball.
+      await execFileAsync('tar', ['-xzf', tmpTar, '-C', targetDir, '--strip-components=1']);
 
       // Validate before trusting: the entrypoint must exist, or we refuse
       // to flip the symlink and leave the working version untouched.

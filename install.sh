@@ -222,6 +222,12 @@ WantedBy=default.target
 UNIT
   systemctl --user daemon-reload
   systemctl --user enable --now kiro-remote-agent.service
+  # `enable --now` starts the unit only if it was stopped; on a re-install
+  # over an already-running service it's a no-op, leaving the old process
+  # (and thus the old code) running even though `current` now points at the
+  # new release. An explicit restart guarantees the daemon relaunches on the
+  # freshly activated version. (launchd above avoids this via unload+load.)
+  systemctl --user restart kiro-remote-agent.service
   # Keep the daemon running when you're not logged in (best-effort).
   loginctl enable-linger "$USER" >/dev/null 2>&1 || warn "Sem 'linger' — o daemon só roda enquanto você estiver logado."
   log "Serviço systemd (user) registrado e iniciado."
