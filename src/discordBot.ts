@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
-import { basename, dirname, join } from 'path';
+import { basename, dirname, isAbsolute, join, resolve } from 'path';
+import { homedir } from 'os';
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -127,7 +128,20 @@ export class DiscordBot {
     private readonly config: AgentConfig,
     private readonly hub: Hub,
   ) {
-    this.threadMapPath = config.DISCORD_THREAD_MAP_PATH;
+    // Anchor a relative thread-map path to the install home (KIRO_REMOTE_HOME,
+    // falling back to ~/.kiro-remote-agent), NOT the process CWD. The default
+    // is "./discord-threads.json"; resolving it against the CWD meant the map
+    // moved whenever the daemon's WorkingDirectory changed (e.g. migrating the
+    // launchd/systemd unit between install layouts), which silently orphaned
+    // every already-created thread and spawned duplicates. An absolute path in
+    // .env is honored as-is.
+    const configuredMapPath = config.DISCORD_THREAD_MAP_PATH;
+    if (isAbsolute(configuredMapPath)) {
+      this.threadMapPath = configuredMapPath;
+    } else {
+      const home = process.env.KIRO_REMOTE_HOME || join(homedir(), '.kiro-remote-agent');
+      this.threadMapPath = resolve(home, configuredMapPath);
+    }
     this.threadMap = this.loadThreadMap();
 
     this.client = new Client({
@@ -142,10 +156,19 @@ export class DiscordBot {
     this.client.once(Events.ClientReady, () => {
       this.ready = true;
       console.log(`[discord] logged in as ${this.client.user?.tag}`);
-      const buffered = this.pendingEvents.splice(0, this.pendingEvents.length);
-      for (const event of buffered) {
-        void this.handleHubEvent(event);
-      }
+      // Rebuild the sessionId->thread map from threads that already exist in
+      // the forum before replaying buffered events, so a lost/empty map (e.g.
+      // after an install-layout migration) reuses the existing thread for a
+      // session instead of creating a duplicate. Best-effort: failures here
+      // just leave the map as-is.
+      void this.rehydrateThreadMapFromForum()
+        .catch((err) => console.error('[discord] thread-map rehydrate failed:', err))
+        .finally(() => {
+          const buffered = this.pendingEvents.splice(0, this.pendingEvents.length);
+          for (const event of buffered) {
+            void this.handleHubEvent(event);
+          }
+        });
     });
 
     this.client.on(Events.MessageCreate, (message) => void this.handleMessage(message));
@@ -603,6 +626,90 @@ export class DiscordBot {
     const prefix = workspaceLabel(local);
     const base = local?.title?.trim() || `Sessão ${sessionId.slice(0, 8)}`;
     return composeTitle(prefix, base);
+  }
+
+  /**
+   * Rebuilds the sessionId->thread map from threads that already exist in the
+   * forum. The map is the only link between a Kiro session and its Discord
+   * thread; if it's lost or starts empty (a fresh install, or a migration that
+   * changed where the file lived), the daemon would create a brand-new thread
+   * for a session that already has one, orphaning the old thread and its
+   * history. Recovering the mapping from each thread's opening
+   * "Sessão local: `sess_...`" message (written only by this bot) reconnects
+   * those threads instead.
+   *
+   * Only fills gaps — an entry already in the map wins (it's the source of
+   * truth the daemon has been writing to). When several forum threads claim
+   * the same session id, the one with the most messages is kept, so recovery
+   * favors the thread that actually carries the conversation.
+   */
+  private async rehydrateThreadMapFromForum(): Promise<void> {
+    const forum = await this.client.channels.fetch(this.config.DISCORD_FORUM_CHANNEL_ID).catch(() => null);
+    if (!forum || forum.type !== ChannelType.GuildForum) return;
+
+    // Gather active + archived public threads in this forum.
+    const threads = new Map<string, ThreadChannel>();
+    try {
+      const active = await forum.threads.fetchActive();
+      for (const t of active.threads.values()) threads.set(t.id, t);
+    } catch (err) {
+      console.error('[discord] rehydrate: failed to fetch active threads:', err);
+    }
+    try {
+      const archived = await forum.threads.fetchArchived();
+      for (const t of archived.threads.values()) threads.set(t.id, t);
+    } catch {
+      // Archived listing can be denied by permissions; active threads alone
+      // are still worth recovering.
+    }
+
+    const botId = this.client.user?.id;
+    if (!botId) return; // can't tell our own session threads apart without it
+    // sessionId -> { threadId, messageCount } best candidate seen so far.
+    const recovered = new Map<string, { threadId: string; messages: number }>();
+
+    // Only threads not already mapped need inspecting — the persisted map is
+    // authoritative and its ids are skipped here.
+    const candidates = [...threads.values()].filter(
+      (t) => this.sessionIdForThread(t.id) === undefined,
+    );
+
+    // Reading each thread's starter is one REST call; doing 150+ of them
+    // sequentially is far too slow to finish before the daemon gets on with
+    // its work. Fetch them in small parallel batches instead (discord.js
+    // queues and rate-limits internally, so this stays well-behaved).
+    const BATCH = 10;
+    for (let i = 0; i < candidates.length; i += BATCH) {
+      const batch = candidates.slice(i, i + BATCH);
+      const starters = await Promise.all(
+        batch.map((t) => t.fetchStarterMessage().catch(() => null)),
+      );
+      for (let j = 0; j < batch.length; j++) {
+        const thread = batch[j];
+        const starter = starters[j];
+        if (!thread || !starter || starter.author.id !== botId) continue; // only our own session threads
+
+        const match = /Sessão local:\s*`(sess_[0-9a-f-]+)`/i.exec(starter.content);
+        const sessionId = match?.[1];
+        if (!sessionId) continue; // default chat or a user-created post — not a session thread
+
+        // Don't override a session id the map already tracks.
+        if (this.threadMap[sessionId]) continue;
+
+        const messages = thread.messageCount ?? 0;
+        const prev = recovered.get(sessionId);
+        if (!prev || messages > prev.messages) {
+          recovered.set(sessionId, { threadId: thread.id, messages });
+        }
+      }
+    }
+
+    if (recovered.size === 0) return;
+    for (const [sessionId, { threadId }] of recovered) {
+      this.threadMap[sessionId] = threadId;
+    }
+    this.saveThreadMap();
+    console.log(`[discord] rehydrated ${recovered.size} thread mapping(s) from the forum.`);
   }
 
   /**
