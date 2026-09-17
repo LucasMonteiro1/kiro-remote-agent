@@ -150,6 +150,17 @@ fi
 ln -sfn "$TARGET_DIR" "$HOME_DIR/current"
 log "Versão $VERSION ativada (current -> releases/$VERSION)."
 
+# --- health-check script (copiado do release para o HOME_DIR) --------------
+# Roda de fora do daemon (é o daemon/kiro-cli que quebra) e avisa no chat
+# padrão do Discord do dev quando o kiro-cli cai/volta. Ver RUNBOOK.md.
+if [ -f "$TARGET_DIR/healthcheck.sh" ]; then
+  cp "$TARGET_DIR/healthcheck.sh" "$HOME_DIR/healthcheck.sh"
+  chmod +x "$HOME_DIR/healthcheck.sh"
+  log "Health-check instalado em $HOME_DIR/healthcheck.sh."
+else
+  warn "healthcheck.sh ausente no release — monitor de saúde não instalado."
+fi
+
 # --- install the Kiro IDE extension ---------------------------------------
 
 if command -v kiro >/dev/null 2>&1 && [ -f "$TARGET_DIR/kiro-remote-bridge.vsix" ]; then
@@ -233,13 +244,82 @@ UNIT
   log "Serviço systemd (user) registrado e iniciado."
 }
 
+# --- health-check service: roda o script a cada 5 min ----------------------
+
+HEALTHCHECK_NAME="com.kiroremote.healthcheck"
+HEALTHCHECK_INTERVAL="${HEALTHCHECK_INTERVAL_SECS:-300}"
+
+install_launchd_healthcheck() {
+  [ -f "$HOME_DIR/healthcheck.sh" ] || return 0
+  local plist="$HOME/Library/LaunchAgents/${HEALTHCHECK_NAME}.plist"
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cat > "$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${HEALTHCHECK_NAME}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>${HOME_DIR}/healthcheck.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>KIRO_REMOTE_HOME</key><string>${HOME_DIR}</string>
+    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:${HOME}/.local/bin</string>
+  </dict>
+  <key>StartInterval</key><integer>${HEALTHCHECK_INTERVAL}</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>${HOME_DIR}/healthcheck.launchd.out.log</string>
+  <key>StandardErrorPath</key><string>${HOME_DIR}/healthcheck.launchd.err.log</string>
+</dict>
+</plist>
+PLIST
+  launchctl unload "$plist" >/dev/null 2>&1 || true
+  launchctl load "$plist"
+  log "Monitor de saúde registrado ($plist) — checa a cada ${HEALTHCHECK_INTERVAL}s."
+}
+
+install_systemd_healthcheck() {
+  [ -f "$HOME_DIR/healthcheck.sh" ] || return 0
+  local unit_dir="$HOME/.config/systemd/user"
+  mkdir -p "$unit_dir"
+  cat > "$unit_dir/kiro-remote-healthcheck.service" <<UNIT
+[Unit]
+Description=kiro-remote-agent health check
+
+[Service]
+Type=oneshot
+Environment=KIRO_REMOTE_HOME=${HOME_DIR}
+ExecStart=/bin/bash ${HOME_DIR}/healthcheck.sh
+UNIT
+  cat > "$unit_dir/kiro-remote-healthcheck.timer" <<UNIT
+[Unit]
+Description=Run kiro-remote-agent health check periodically
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=${HEALTHCHECK_INTERVAL}sec
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl --user daemon-reload
+  systemctl --user enable --now kiro-remote-healthcheck.timer
+  log "Monitor de saúde (systemd timer) registrado — checa a cada ${HEALTHCHECK_INTERVAL}s."
+}
+
 case "$(uname -s)" in
-  Darwin) install_launchd ;;
+  Darwin) install_launchd; install_launchd_healthcheck ;;
   Linux)
     if command -v systemctl >/dev/null 2>&1; then
       install_systemd
+      install_systemd_healthcheck
     else
       warn "systemd não disponível. Rode manualmente: KIRO_REMOTE_MANAGED=1 KIRO_REMOTE_HOME=$HOME_DIR $NODE_BIN $HOME_DIR/current/dist/index.js"
+      warn "Monitor de saúde não registrado (sem systemd). Rode periodicamente: KIRO_REMOTE_HOME=$HOME_DIR bash $HOME_DIR/healthcheck.sh"
     fi
     ;;
 esac

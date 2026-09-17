@@ -60,16 +60,36 @@ Nada a fazer manualmente.
 Para pausar as atualizações, coloque `AUTO_UPDATE=false` no seu
 `~/.kiro-remote-agent/.env` e reinicie o serviço.
 
+### Monitor de saúde
+
+O instalador registra um segundo serviço (`com.kiroremote.healthcheck` no
+macOS / `kiro-remote-healthcheck.timer` no Linux) que roda a cada 5 min e
+verifica se o `kiro-cli` continua logado. A autenticação é SSO e **expira**;
+quando isso acontece o daemon para de espelhar as sessões, mas o bot do
+Discord continua online — uma falha silenciosa.
+
+O monitor elimina o silêncio: quando o `kiro-cli` cai, ele posta um alerta
+🔴 (com o passo a passo pra corrigir) **no seu próprio chat padrão do
+Discord**, e um ✅ quando volta. Só avisa na mudança de estado, sem repetir.
+Nada é postado em canal compartilhado.
+
+O passo a passo de diagnóstico e correção está no [RUNBOOK.md](./RUNBOOK.md).
+
 ### Desinstalar
 
 ```bash
 # macOS
 launchctl unload ~/Library/LaunchAgents/com.kiroremote.agent.plist
+launchctl unload ~/Library/LaunchAgents/com.kiroremote.healthcheck.plist
 rm ~/Library/LaunchAgents/com.kiroremote.agent.plist
+rm ~/Library/LaunchAgents/com.kiroremote.healthcheck.plist
 
 # Linux
 systemctl --user disable --now kiro-remote-agent.service
+systemctl --user disable --now kiro-remote-healthcheck.timer
 rm ~/.config/systemd/user/kiro-remote-agent.service
+rm ~/.config/systemd/user/kiro-remote-healthcheck.service
+rm ~/.config/systemd/user/kiro-remote-healthcheck.timer
 
 # ambos
 rm -rf ~/.kiro-remote-agent

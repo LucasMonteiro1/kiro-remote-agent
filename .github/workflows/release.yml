@@ -156,6 +156,7 @@ jobs:
           cp -R dist "$STAGE/dist"
           cp -R vendor "$STAGE/vendor"
           cp .env.example "$STAGE/.env.example"
+          cp healthcheck.sh "$STAGE/healthcheck.sh"
           cp kiro-remote-bridge.vsix "$STAGE/kiro-remote-bridge.vsix"
           tar -czf "kiro-remote-agent-${VERSION}-${{ matrix.target }}.tar.gz" -C stage kiro-remote-agent
 
