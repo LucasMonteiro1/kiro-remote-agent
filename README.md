@@ -302,7 +302,7 @@ yarn dev
 | `KIRO_CLI_BIN`                    | Caminho do binário `kiro-cli`. Se for rodar via `pm2`/`launchd` (PATH restrito), use o caminho absoluto (ex: `/Users/voce/.local/bin/kiro-cli`) |
 | `KIRO_PROJECT_DIR`                | Diretório do projeto onde o `kiro-cli` deve rodar                             |
 | `KIRO_SESSION_ID`                 | (Opcional) ID de sessão específica a retomar; se vazio, usa a mais recente     |
-| `KIRO_TRUST_TOOLS`                | Categorias de tool pré-aprovadas (ex: `read,grep`); vazio = tudo passa por aprovação manual pelo Discord |
+| `KIRO_TRUST_TOOLS`                | Nomes de tool do kiro-cli pré-aprovados, ex: `fs_read` (leitura/busca), `fs_write` (edição), `execute_bash` (shell); vazio = tudo passa por aprovação manual pelo Discord |
 | `KIRO_API_KEY`                    | Chave de API do Kiro para autenticação automatizada                           |
 | `APPROVAL_PROMPT_REGEX`           | Regex para detectar prompts de aprovação — **calibrar** (ver aviso abaixo)      |
 | `APPROVE_KEYSTROKES` / `DENY_KEYSTROKES` / `APPROVE_ALWAYS_KEYSTROKES` | Teclas enviadas ao PTY para cada decisão — **calibrar**      |
@@ -407,9 +407,11 @@ entre reinicializações — veja `launchctl` / `~/Library/LaunchAgents`.
 - O `HUB_SHARED_SECRET` protege o hub local (que só a extensão do Kiro IDE
   usa) — trate como senha também, mas o risco é bem menor já que o hub
   nunca é exposto para fora do seu PC.
-- Por padrão (`KIRO_TRUST_TOOLS` vazio), **toda** chamada de tool passa por
-  aprovação manual, igual no Kiro IDE. Só relaxe isso (adicionando
-  categorias em `KIRO_TRUST_TOOLS`) se tiver certeza do que está liberando.
+- Se `KIRO_TRUST_TOOLS` estiver vazio, **toda** chamada de tool passa por
+  aprovação manual, igual no Kiro IDE. O padrão recomendado (`fs_read`)
+  libera só leitura/busca de arquivos e mantém `fs_write` e `execute_bash`
+  atrás da aprovação. Só adicione as tools de escrita/shell se tiver certeza
+  do que está liberando.
 - `DEBUG_LOG_PATH` pode conter trechos da sua conversa/código em texto
   puro — já está no `.gitignore`, mas delete o arquivo depois de calibrar a
   regex de aprovação.

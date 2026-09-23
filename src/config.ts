@@ -41,7 +41,7 @@ const envSchema = z.object({
   // --- Keystrokes sent back into the PTY for each approval decision ---
   APPROVE_KEYSTROKES: z.string().default('y\r'),
   DENY_KEYSTROKES: z.string().default('n\r'),
-  APPROVE_ALWAYS_KEYSTROKES: z.string().default('a\r'),
+  APPROVE_ALWAYS_KEYSTROKES: z.string().default('t\r'),
 
   // --- Auto-update (only active when running under the managed install layout) ---
   /** Master switch for the self-updater. When false, the daemon never checks for or applies updates. */
