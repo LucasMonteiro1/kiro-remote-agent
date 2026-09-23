@@ -720,12 +720,32 @@ export class DiscordBot {
    * but only calls Discord's rename API when the computed title actually
    * changed — Discord rate-limits channel renames hard (roughly twice per
    * ten minutes), so a no-op reconcile must not touch the network.
+   *
+   * Crucially, a real IDE session is only reconciled while the current scan
+   * still knows about it. The scan keeps just the N most recently modified
+   * sessions (see MAX_SYNCED_SESSIONS in sessionScanner), so an older thread
+   * eventually ages out of it. When that happens buildThreadTitle has no
+   * session data and would fall back to the generic "Sessão <id>" title —
+   * renaming here would clobber the real title Kiro had already assigned
+   * (the exact bug where an old, correctly-named thread reverts to
+   * "Sessão sess_xxxx"). The generic fallback is only ever appropriate at
+   * thread *creation* (getOrCreateThread), never as a downgrade here, so a
+   * session missing from the scan is skipped and keeps whatever title it has.
    */
   private async reconcileThreadTitles(): Promise<void> {
     if (!this.ready) return;
 
+    const localSessions = this.hub.getLocalSessions();
+
     for (const [key, threadId] of Object.entries(this.threadMap)) {
       const sessionId = key === DEFAULT_SESSION_KEY ? undefined : key;
+
+      // Skip real sessions the current scan can't see — we have no real
+      // title for them and must not overwrite a good one with the fallback.
+      if (sessionId !== undefined && !localSessions.some((s) => s.id === sessionId)) {
+        continue;
+      }
+
       const desired = this.buildThreadTitle(sessionId);
 
       const thread = await this.fetchThread(threadId);
