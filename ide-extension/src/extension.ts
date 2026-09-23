@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import WebSocket from 'ws';
+import { openCreditsDashboard } from './creditsDashboard';
 import {
   closeSync,
   mkdirSync,
@@ -90,6 +91,13 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand('kiroRemoteBridge.showLog', () => output.show(true)),
+    vscode.commands.registerCommand('kiroRemoteBridge.showCredits', () => {
+      try {
+        openCreditsDashboard(context);
+      } catch (err) {
+        vscode.window.showErrorMessage(`Falha ao abrir o dashboard de créditos: ${describeError(err)}`);
+      }
+    }),
     vscode.commands.registerCommand('kiroRemoteBridge.showStatus', () => {
       const config = readConfig();
       const parts = [

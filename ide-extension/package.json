@@ -48,6 +48,10 @@
       {
         "command": "kiroRemoteBridge.showLog",
         "title": "Kiro Remote Bridge: Show Log"
+      },
+      {
+        "command": "kiroRemoteBridge.showCredits",
+        "title": "Kiro Remote Bridge: Consumo de Créditos"
       }
     ]
   },
