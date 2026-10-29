@@ -844,13 +844,36 @@ function recentSessionsForThisWindow(): { sessionId: string; modifiedAt: number 
       }
       if (modifiedAt < cutoff) continue;
 
-      const sessionPaths = readSessionWorkspacePaths(sessionId);
-      if (!sessionPaths || !sameWorkspace(sessionPaths, ourPaths)) continue;
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(readFileSync(join(workspacePath, sessionId, 'session.json'), 'utf8')) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      // Workflow step / sub-agent sessions aren't streamed: the user didn't
+      // start them, and a single workflow spawns many, which would also push
+      // the parent session out of the MAX_WATCHED_SESSIONS window.
+      if (isChildSessionMeta(parsed)) continue;
+      const sessionPaths = Array.isArray(parsed.workspacePaths) ? parsed.workspacePaths.map(String) : [];
+      if (!sameWorkspace(sessionPaths, ourPaths)) continue;
       found.push({ sessionId, modifiedAt });
     }
   }
 
   return found.sort((a, b) => b.modifiedAt - a.modifiedAt);
+}
+
+/**
+ * A session spawned by another session (workflow step, sub-agent). Kiro marks
+ * those with `rootConversationId` pointing at the parent and, for workflow
+ * steps, `_meta.kiro.workflow`. Mirrors isChildSessionMeta in the daemon's
+ * src/sessionScanner.ts.
+ */
+function isChildSessionMeta(parsed: Record<string, unknown>): boolean {
+  const root = parsed.rootConversationId;
+  if (typeof root === 'string' && root && root !== parsed.id) return true;
+  const meta = parsed._meta as { kiro?: { workflow?: unknown } } | undefined;
+  return Boolean(meta && typeof meta === 'object' && meta.kiro?.workflow);
 }
 
 function findSessionDir(sessionId: string): string | null {

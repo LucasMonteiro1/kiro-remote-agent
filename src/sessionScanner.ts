@@ -59,6 +59,9 @@ export function scanSessionSummaries(): SessionSummary[] {
       try {
         const raw = readFileSync(sessionJsonPath, 'utf8');
         const parsed = JSON.parse(raw) as Record<string, unknown>;
+        // Workflow step sessions are internal to a parent session; they never
+        // get a Discord thread, so don't let them take slots in this cache.
+        if (isChildSessionMeta(parsed)) continue;
         summaries.push({
           id: String(parsed.id ?? sessionDir),
           title: truncate(String(parsed.title ?? ''), MAX_TITLE_LENGTH),
@@ -80,6 +83,50 @@ export function scanSessionSummaries(): SessionSummary[] {
   // Most recently touched first, capped to MAX_SYNCED_SESSIONS.
   summaries.sort((a, b) => (b.lastModifiedAt ?? '').localeCompare(a.lastModifiedAt ?? ''));
   return summaries.slice(0, MAX_SYNCED_SESSIONS);
+}
+
+/**
+ * A session spawned by another session (a workflow step, a sub-agent) and
+ * not started by the user. Kiro marks those with `rootConversationId`
+ * pointing at the parent and, for workflow steps, `_meta.kiro.workflow`.
+ */
+export function isChildSessionMeta(parsed: Record<string, unknown>): boolean {
+  const root = parsed.rootConversationId;
+  if (typeof root === 'string' && root && root !== parsed.id) return true;
+  const meta = parsed._meta as { kiro?: { workflow?: unknown } } | undefined;
+  return Boolean(meta && typeof meta === 'object' && meta.kiro?.workflow);
+}
+
+/** sessionId -> whether it's a child session. The flag never changes for a session, so it's cached forever. */
+const childSessionCache = new Map<string, boolean>();
+
+/**
+ * Whether `sessionId` is a child (workflow step / sub-agent) session, read
+ * from its session.json. Unknown or unreadable sessions are treated as
+ * top-level and not cached, so a session whose session.json hasn't landed
+ * yet gets re-checked on the next event.
+ */
+export function isChildSession(sessionId: string): boolean {
+  const cached = childSessionCache.get(sessionId);
+  if (cached !== undefined) return cached;
+
+  let workspaceDirs: string[];
+  try {
+    workspaceDirs = readdirSync(KIRO_SESSIONS_DIR);
+  } catch {
+    return false;
+  }
+  for (const workspaceDir of workspaceDirs) {
+    try {
+      const raw = readFileSync(join(KIRO_SESSIONS_DIR, workspaceDir, sessionId, 'session.json'), 'utf8');
+      const result = isChildSessionMeta(JSON.parse(raw) as Record<string, unknown>);
+      childSessionCache.set(sessionId, result);
+      return result;
+    } catch {
+      // Not in this workspace dir; keep looking.
+    }
+  }
+  return false;
 }
 
 function truncate(text: string, maxLength: number): string {

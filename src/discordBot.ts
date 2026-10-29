@@ -8,6 +8,7 @@ import {
   ButtonStyle,
   ChannelType,
   Client,
+  SortOrderType,
   Events,
   GatewayIntentBits,
   Partials,
@@ -19,7 +20,7 @@ import {
 import type { AgentConfig } from './config';
 import type { Hub, ApprovalResolvedInfo } from './hub';
 import type { HubEvent, MessageAttachment, ToolApprovalDecision } from './hubProtocol';
-import type { SessionSummary } from './sessionScanner';
+import { isChildSession, type SessionSummary } from './sessionScanner';
 import { isAudioAttachment, transcribeAudioAttachments, unavailableReason } from './audioTranscribe';
 
 /** Discord hard-caps a single message at this many characters. */
@@ -75,6 +76,8 @@ export class DiscordBot {
   /** toolName shown alongside a pending approval_request, purely for the edited message's final text. */
   private readonly pendingApprovalMeta = new Map<string, { promptText: string; toolName?: string }>();
   private ready = false;
+  /** Set once rehydrateThreadMapFromForum has finished (successfully or not). */
+  private threadMapReady = false;
   /** Events that arrive before the client finishes logging in (e.g. the daemon's own startup status message) are buffered here and flushed once ready, instead of being silently dropped. */
   private readonly pendingEvents: HubEvent[] = [];
   /**
@@ -86,6 +89,14 @@ export class DiscordBot {
    * for it.
    */
   private readonly pendingNewSessionThreads: string[] = [];
+  /**
+   * Thread lookups/creations in flight, keyed like threadMap. Hub events are
+   * handled concurrently (fire-and-forget), so a burst of events for a
+   * session without a thread used to make each one create its own post —
+   * the duplicate "[workspace] same title" posts. Every caller for the same
+   * key now awaits the same promise instead.
+   */
+  private readonly threadInFlight = new Map<string, Promise<ThreadChannel | null>>();
   /**
    * Event ids for user_message events *this bot itself* created by calling
    * hub.sendUserMessage (i.e. the user typed into a Discord thread, or a
@@ -161,9 +172,11 @@ export class DiscordBot {
       // after an install-layout migration) reuses the existing thread for a
       // session instead of creating a duplicate. Best-effort: failures here
       // just leave the map as-is.
+      void this.ensureForumSortedByActivity();
       void this.rehydrateThreadMapFromForum()
         .catch((err) => console.error('[discord] thread-map rehydrate failed:', err))
         .finally(() => {
+          this.threadMapReady = true;
           const buffered = this.pendingEvents.splice(0, this.pendingEvents.length);
           for (const event of buffered) {
             void this.handleHubEvent(event);
@@ -299,7 +312,10 @@ export class DiscordBot {
   // --- outgoing to Discord ---
 
   private async handleHubEvent(event: HubEvent): Promise<void> {
-    if (!this.ready) {
+    // Also hold events while the forum rehydrate is running: posting before
+    // the map is rebuilt would create a second post for a session that
+    // already has one.
+    if (!this.ready || !this.threadMapReady) {
       this.pendingEvents.push(event);
       return;
     }
@@ -338,6 +354,12 @@ export class DiscordBot {
       if (thread && text) await thread.send(text).catch(() => {});
       return;
     }
+
+    // Workflow step / sub-agent sessions are internal to a parent session the
+    // user started. They never get their own post: the parent session already
+    // receives each step's outcome as a notification in its own transcript,
+    // which reaches the parent's thread through its own events.
+    if (event.sessionId && isChildSession(event.sessionId)) return;
 
     try {
       const thread = await this.getOrCreateThread(event.sessionId);
@@ -508,6 +530,17 @@ export class DiscordBot {
    */
   private async getOrCreateThread(sessionId: string | undefined): Promise<ThreadChannel | null> {
     const key = sessionId ?? DEFAULT_SESSION_KEY;
+    const inFlight = this.threadInFlight.get(key);
+    if (inFlight) return inFlight;
+
+    const pending = this.resolveOrCreateThread(sessionId, key).finally(() => {
+      this.threadInFlight.delete(key);
+    });
+    this.threadInFlight.set(key, pending);
+    return pending;
+  }
+
+  private async resolveOrCreateThread(sessionId: string | undefined, key: string): Promise<ThreadChannel | null> {
     const existingId = this.threadMap[key];
     if (existingId) {
       const existing = await this.fetchThread(existingId);
@@ -643,6 +676,25 @@ export class DiscordBot {
    * the same session id, the one with the most messages is kept, so recovery
    * favors the thread that actually carries the conversation.
    */
+  /**
+   * Makes the forum list posts by latest activity (newest message first)
+   * instead of creation date, so sessions with recent replies float to the
+   * top. This is the forum's default; a user who picked another order in
+   * their own Discord client ("Ordenar e visualizar") keeps their choice.
+   * Needs the Manage Channels permission; without it this just logs.
+   */
+  private async ensureForumSortedByActivity(): Promise<void> {
+    try {
+      const forum = await this.client.channels.fetch(this.config.DISCORD_FORUM_CHANNEL_ID);
+      if (!forum || forum.type !== ChannelType.GuildForum) return;
+      if (forum.defaultSortOrder === SortOrderType.LatestActivity) return;
+      await forum.setDefaultSortOrder(SortOrderType.LatestActivity);
+      console.log('[discord] forum default sort order set to latest activity.');
+    } catch (err) {
+      console.error('[discord] could not set forum sort order (needs Manage Channels):', err);
+    }
+  }
+
   private async rehydrateThreadMapFromForum(): Promise<void> {
     const forum = await this.client.channels.fetch(this.config.DISCORD_FORUM_CHANNEL_ID).catch(() => null);
     if (!forum || forum.type !== ChannelType.GuildForum) return;
