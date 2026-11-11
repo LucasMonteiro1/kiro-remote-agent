@@ -20,6 +20,11 @@ import { randomBytes } from 'crypto';
  * usage_summary line in its messages.jsonl. Sessions in the older on-disk
  * format never wrote usage_summary and are counted as "skipped" (no credit
  * data to recover), reported in a footnote.
+ *
+ * Sessions the user didn't start (workflow steps, sub-agents) carry
+ * `rootConversationId` = the session that launched them. Their credits are
+ * folded into that parent's row, which may live under another workspace hash
+ * (worktrees), so the merge is done across all workspaces by id.
  */
 
 const KIRO_SESSIONS_DIR = join(homedir(), '.kiro', 'sessions');
@@ -33,6 +38,14 @@ interface CreditSession {
   agent: string;
   workspace: string;
   date: string | null; // YYYY-MM-DD (createdAt)
+  childCount: number; // workflow/sub-agent sessions folded into this row
+  childCredits: number;
+}
+
+interface RawSession {
+  row: CreditSession;
+  rootId: string | null; // parent session id, for child sessions
+  hasData: boolean;
 }
 
 interface ScanResult {
@@ -86,14 +99,13 @@ function isoToDate(value: unknown): string | null {
 
 /** Scans every local Kiro session and returns per-session credit totals. */
 export function scanSessionCredits(): ScanResult {
-  const sessions: CreditSession[] = [];
-  let skipped = 0;
+  const raws: RawSession[] = [];
 
   let workspaceDirs: string[];
   try {
     workspaceDirs = readdirSync(KIRO_SESSIONS_DIR);
   } catch {
-    return { sessions, skipped };
+    return { sessions: [], skipped: 0 };
   }
 
   for (const workspaceDir of workspaceDirs) {
@@ -118,10 +130,6 @@ export function scanSessionCredits(): ScanResult {
       if (!hasMessages) continue;
 
       const { credits, turns, hasData } = sumCredits(messagesPath);
-      if (!hasData) {
-        skipped += 1; // older format, no credit tracking
-        continue;
-      }
 
       let meta: Record<string, unknown> = {};
       try {
@@ -137,19 +145,66 @@ export function scanSessionCredits(): ScanResult {
         ? basename(workspacePaths[0]!.replace(/\/+$/, ''))
         : '(sem workspace)';
 
-      sessions.push({
-        id: String(meta.id ?? sessionDir),
-        title: (typeof meta.title === 'string' && meta.title.trim()) || '(sem título)',
-        credits: Math.round(credits * 100) / 100,
-        turns,
-        model: typeof meta.modelId === 'string' ? meta.modelId : '?',
-        agent: typeof meta.agentMode === 'string' ? meta.agentMode : '?',
-        workspace: primaryWs,
-        date: isoToDate(meta.createdAt),
+      const id = String(meta.id ?? sessionDir);
+      const root = meta.rootConversationId;
+      raws.push({
+        row: {
+          id,
+          title: (typeof meta.title === 'string' && meta.title.trim()) || '(sem título)',
+          credits,
+          turns,
+          model: typeof meta.modelId === 'string' ? meta.modelId : '?',
+          agent: typeof meta.agentMode === 'string' ? meta.agentMode : '?',
+          workspace: primaryWs,
+          date: isoToDate(meta.createdAt),
+          childCount: 0,
+          childCredits: 0,
+        },
+        rootId: typeof root === 'string' && root && root !== id ? root : null,
+        hasData,
       });
     }
   }
 
+  return foldChildSessions(raws);
+}
+
+/**
+ * Folds child sessions (rootConversationId set) into their parent row.
+ * A child whose parent isn't on disk keeps its own row.
+ */
+export function foldChildSessions(raws: RawSession[]): ScanResult {
+  const byId = new Map<string, RawSession>();
+  for (const r of raws) byId.set(r.row.id, r);
+
+  const withData = new Set<RawSession>();
+  for (const r of raws) {
+    const parent = r.rootId ? byId.get(r.rootId) : undefined;
+    if (!parent) {
+      if (r.hasData) withData.add(r);
+      continue;
+    }
+    if (!r.hasData) continue;
+    parent.row.credits += r.row.credits;
+    parent.row.turns += r.row.turns;
+    parent.row.childCount += 1;
+    parent.row.childCredits += r.row.credits;
+    withData.add(parent);
+  }
+
+  const round = (n: number): number => Math.round(n * 100) / 100;
+  const sessions: CreditSession[] = [];
+  let skipped = 0;
+  for (const r of raws) {
+    if (r.rootId && byId.has(r.rootId)) continue; // folded into its parent
+    if (!withData.has(r)) {
+      skipped += 1; // older format, no credit tracking
+      continue;
+    }
+    r.row.credits = round(r.row.credits);
+    r.row.childCredits = round(r.row.childCredits);
+    sessions.push(r.row);
+  }
   return { sessions, skipped };
 }
 
@@ -258,6 +313,7 @@ function renderHtml(sessions: CreditSession[], skipped: number): string {
   .tag { display:inline-block; background:var(--panel2); border:1px solid var(--line);
     border-radius:6px; padding:1px 7px; font-size:11px; color:var(--muted); }
   .credit { color:var(--accent2); font-weight:640; }
+  .kids { color:var(--muted); font-size:11px; margin-top:2px; }
   .minibar { height:4px; background:var(--bar); border-radius:3px; margin-top:5px; }
   .foot { color:var(--muted); font-size:12px; margin-top:18px; }
   @media (max-width:720px){ .cards{grid-template-columns:repeat(2,1fr);}
@@ -408,6 +464,7 @@ function renderRows(){
   document.getElementById('rows').innerHTML = rows.map(function(s){
     return '<tr>'+
       '<td class="title-cell"><div class="t">'+esc(s.title)+'</div>'+
+        (s.childCount ? '<div class="kids">inclui '+s.childCount+' sessões de workflow · '+fmt(s.childCredits)+' créditos</div>' : '')+
         '<div class="minibar" style="width:'+(s.credits/max*100).toFixed(1)+'%"></div></td>'+
       '<td>'+(s.date||'—')+'</td>'+
       '<td class="num credit">'+fmt(s.credits)+'</td>'+
