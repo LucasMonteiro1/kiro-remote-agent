@@ -88,7 +88,14 @@ export type HubEvent =
 // --- Extension -> Hub ---
 
 export type ClientToHub =
-  | { v: 1; kind: 'hello'; secret: string; hostLabel: string }
+  /**
+   * `workspacePaths` are the folders open in the extension's window. Every
+   * window streams every active session, so the hub uses these to pick one
+   * owner per session (see Hub.sessionOwner). Older extensions omit it.
+   */
+  | { v: 1; kind: 'hello'; secret: string; hostLabel: string; workspacePaths?: string[] }
+  /** The window's folders changed (folder added/removed in the .code-workspace). */
+  | { v: 1; kind: 'workspace'; workspacePaths: string[] }
   /**
    * Report a new event (assistant reply, tool call, etc) from a live IDE
    * session. The hub assigns createdAt and, if the caller didn't supply
@@ -101,8 +108,9 @@ export type ClientToHub =
   /**
    * Single-delivery guard. Every open Kiro IDE window runs its own
    * extension and all of them receive every broadcast `event`; before
-   * acting on one tagged for a session it owns, an extension must claim
-   * it first — only the first caller gets `claimed: true`.
+   * acting on one tagged for a session, an extension must claim it first —
+   * only the first caller gets `claimed: true`, and when the session has an
+   * owner window, only that window can claim it.
    */
   | { v: 1; kind: 'claim_event'; eventId: string; by?: string };
 

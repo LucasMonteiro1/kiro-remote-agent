@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import { WebSocket, WebSocketServer } from 'ws';
 import type { AgentConfig } from './config';
 import type { ClientToHub, HubEvent, HubToClient, MessageAttachment, ToolApprovalDecision } from './hubProtocol';
-import type { SessionSummary } from './sessionScanner';
+import { sessionWorkspacePaths, type SessionSummary } from './sessionScanner';
 
 const MAX_EVENTS_IN_MEMORY = 2000; // bounds the internal approval-lookup index; Discord itself is now the durable chat log
 const CLAIM_TTL_MS = 60 * 60 * 1000;
@@ -10,6 +10,8 @@ const CLAIM_TTL_MS = 60 * 60 * 1000;
 interface Connection {
   ws: WebSocket;
   hostLabel?: string;
+  /** Folders open in that window. Undefined for extensions older than session ownership — those are never filtered. */
+  workspacePaths?: string[];
 }
 
 type NewEvent = {
@@ -178,6 +180,7 @@ export class Hub {
           helloTimer = null;
         }
         conn.hostLabel = msg.hostLabel;
+        if (Array.isArray(msg.workspacePaths)) conn.workspacePaths = msg.workspacePaths.map(String);
         this.connections.add(conn);
         this.send(ws, { v: 1, kind: 'welcome', now: Date.now() });
         return;
@@ -196,24 +199,77 @@ export class Hub {
     });
   }
 
-  private handleMessage(_conn: Connection, msg: ClientToHub): void {
+  private handleMessage(conn: Connection, msg: ClientToHub): void {
     switch (msg.kind) {
+      case 'workspace': {
+        if (Array.isArray(msg.workspacePaths)) conn.workspacePaths = msg.workspacePaths.map(String);
+        return;
+      }
       case 'push_event': {
+        // Every window tails every active session, so the same transcript
+        // line arrives once per open window; only the owner's copy counts.
+        if (!this.mayActFor(conn, msg.event.sessionId)) return;
         this.emitEvent(msg.event as NewEvent);
         return;
       }
       case 'resolve_approval': {
+        if (!this.mayActFor(conn, this.sessionIdOfEvent(msg.requestId))) return;
         this.resolveApproval(msg.requestId, msg.decision);
         return;
       }
       case 'claim_event': {
-        const claimed = this.claimEvent(msg.eventId);
-        this.send(_conn.ws, { v: 1, kind: 'claim_result', eventId: msg.eventId, claimed });
+        const claimed = this.mayActFor(conn, this.sessionIdOfEvent(msg.eventId)) && this.claimEvent(msg.eventId);
+        this.send(conn.ws, { v: 1, kind: 'claim_result', eventId: msg.eventId, claimed });
         return;
       }
       default:
         return;
     }
+  }
+
+  // --- session ownership (several IDE windows) ---
+
+  /**
+   * Whether `conn` may push events for / claim messages of `sessionId`.
+   * Legacy connections (no workspacePaths) and sessions with no owner are
+   * never filtered, which keeps the old first-claim-wins behaviour.
+   */
+  private mayActFor(conn: Connection, sessionId: string | undefined): boolean {
+    if (!sessionId || !conn.workspacePaths) return true;
+    const owner = this.sessionOwner(sessionId);
+    return !owner || owner === conn;
+  }
+
+  /**
+   * The open window that should stream and answer a session: the one whose
+   * folders match the session's best — exact set first, then most shared
+   * folders, then fewest non-shared, then the earliest connected. A session
+   * whose folders match no window exactly (e.g. a folder was removed from
+   * the .code-workspace after it was created) still gets an owner.
+   */
+  private sessionOwner(sessionId: string): Connection | null {
+    const sessionPaths = sessionWorkspacePaths(sessionId);
+    if (!sessionPaths) return null;
+
+    let best: Connection | null = null;
+    let bestScore: [number, number, number] | null = null;
+    for (const conn of this.connections) {
+      if (!conn.workspacePaths) continue;
+      const score = matchScore(sessionPaths, conn.workspacePaths);
+      if (!bestScore || compareScores(score, bestScore) > 0) {
+        best = conn;
+        bestScore = score;
+      }
+    }
+    return best;
+  }
+
+  private sessionIdOfEvent(eventId: string): string | undefined {
+    for (let i = this.events.length - 1; i >= 0; i--) {
+      const event = this.events[i]!;
+      if (event.id === eventId) return event.sessionId ?? undefined;
+    }
+    return undefined;
   }
 
   /** True only for the first caller within CLAIM_TTL_MS of a given eventId — lets multiple open IDE windows share the same event stream without double-delivering a message. */
@@ -262,6 +318,22 @@ export class Hub {
     if (ws.readyState !== WebSocket.OPEN) return;
     ws.send(JSON.stringify(msg));
   }
+}
+
+/** [exact set match, shared folders, -non-shared folders]; higher is better. */
+function matchScore(sessionPaths: string[], windowPaths: string[]): [number, number, number] {
+  const windowSet = new Set(windowPaths);
+  const shared = new Set(sessionPaths.filter((path) => windowSet.has(path))).size;
+  const union = new Set([...sessionPaths, ...windowPaths]).size;
+  const exact = shared === union ? 1 : 0;
+  return [exact, shared, -(union - shared)];
+}
+
+function compareScores(a: [number, number, number], b: [number, number, number]): number {
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return a[i]! - b[i]!;
+  }
+  return 0;
 }
 
 function timingSafeEqual(a: string, b: string): boolean {

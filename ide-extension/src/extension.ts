@@ -8,6 +8,7 @@ import {
   readFileSync,
   readSync,
   readdirSync,
+  renameSync,
   statSync,
   writeFileSync,
 } from 'fs';
@@ -45,10 +46,27 @@ import { randomUUID } from 'crypto';
 const KIRO_SESSIONS_DIR = join(homedir(), '.kiro', 'sessions');
 /** Only stream sessions touched this recently — old history isn't interesting. */
 const RECENT_WINDOW_MS = 24 * 60 * 60 * 1000;
-/** Upper bound on concurrently streamed sessions, most recently active first. */
-const MAX_WATCHED_SESSIONS = 12;
+/**
+ * Safety cap on concurrently streamed sessions, most recently active first.
+ * Sized so every session active in the last day fits; a watcher is one
+ * stat() every WATCH_INTERVAL_MS, so this is cheap.
+ */
+const MAX_WATCHED_SESSIONS = 60;
 /** How often to look for sessions in this window that should be streamed. */
 const DISCOVER_INTERVAL_MS = 10000;
+/**
+ * Where each session was last forwarded up to (byte offset in its
+ * messages.jsonl), so a watcher resumes from there instead of from the end
+ * of the file. Without it, anything a session wrote while no watcher was
+ * running (window reload, daemon down, discovery lag) never reached Discord.
+ */
+const PROGRESS_FILE = join(homedir(), '.kiro-remote-agent', 'bridge-progress.json');
+/** Entries for sessions untouched this long are dropped from PROGRESS_FILE. */
+const PROGRESS_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+/** How often dirty progress is written to disk. */
+const PROGRESS_FLUSH_MS = 5000;
+/** A backlog bigger than this is skipped instead of replayed, so a long-unwatched session can't flood Discord. */
+const MAX_CATCHUP_BYTES = 2 * 1024 * 1024;
 /** How often to tail each watched session's messages.jsonl for new lines. */
 const WATCH_INTERVAL_MS = 2000;
 /** Window for matching a file entry against a message we just delivered. */
@@ -64,6 +82,8 @@ const RECONNECT_MIN_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 
 let output: vscode.OutputChannel;
+/** Transcripts born after this are new sessions, streamed from byte 0. */
+const activatedAt = Date.now();
 let hubSocket: HubSocket | undefined;
 let lastError: string | null = null;
 let deliveredCount = 0;
@@ -117,6 +137,10 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      log(`Workspace folders changed: [${currentWorkspacePaths().join(', ')}]`);
+      hubSocket?.send({ v: 1, kind: 'workspace', workspacePaths: currentWorkspacePaths() });
+    }),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration('kiroRemoteBridge')) {
         log('Configuration changed, reconnecting.');
@@ -129,6 +153,7 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export function deactivate(): void {
+  flushProgress();
   hubSocket?.close();
   if (discoverTimer) clearInterval(discoverTimer);
   for (const watcher of watchers.values()) clearInterval(watcher.timer);
@@ -194,6 +219,7 @@ class HubSocket {
           role: 'extension',
           secret: this.config.hubSecret,
           hostLabel: HOST_LABEL,
+          workspacePaths: currentWorkspacePaths(),
         }),
       );
     });
@@ -310,10 +336,10 @@ function startDiscovery(config: BridgeConfig): void {
 const HOST_LABEL = 'kiro-ide';
 
 /**
- * Delivers one remote message into a local session, if that session belongs
- * to this window. Every Kiro window runs its own copy of this extension, so
- * we filter by workspace and then claim the message on the hub to make
- * sure exactly one window delivers it.
+ * Delivers one remote message into a local session. Every Kiro window runs
+ * its own copy of this extension and receives the message; the hub's claim
+ * lets only the session's owner window (best folder match, see
+ * Hub.sessionOwner) deliver it.
  */
 async function handleRemoteMessage(
   config: BridgeConfig,
@@ -325,9 +351,9 @@ async function handleRemoteMessage(
   const isNew = sessionId === NEW_SESSION_SENTINEL;
 
   // A "create a new session" request isn't tied to a workspace yet, so any
-  // window could serve it; the claim below decides which one does. For an
-  // existing session, only the window that owns its workspace handles it.
-  if (!isNew && !sessionBelongsToThisWindow(sessionId)) return;
+  // window could serve it. For an existing session the hub only grants the
+  // claim to the owner window.
+  if (!isNew && !findSessionDir(sessionId)) return;
 
   const claimed = (await hubSocket?.claim(eventId)) ?? false;
   if (!claimed) {
@@ -427,8 +453,6 @@ async function handleRemoteApprovalResponse(
   decision: string,
   eventId: string,
 ): Promise<void> {
-  if (!sessionBelongsToThisWindow(sessionId)) return;
-
   const pending = pendingApprovals.get(requestId);
   if (!pending || pending.sessionId !== sessionId) {
     // Either this window never streamed the originating prompt, or it was
@@ -501,6 +525,8 @@ async function waitForApprovalResolved(requestId: string, timeoutMs: number): Pr
 interface SessionWatcher {
   timer: NodeJS.Timeout;
   offset: number;
+  /** The next read is a replayed backlog (see startOffset). */
+  catchingUp: boolean;
 }
 
 const watchers = new Map<string, SessionWatcher>();
@@ -526,12 +552,15 @@ const toolTitleByCallId = new Map<string, string>();
 let approvalQueue: Promise<void> = Promise.resolve();
 
 /**
- * Keeps the set of streamed sessions in sync with what's actually active in
- * this window: every session of this workspace touched in the last day, most
- * recent first, capped so we don't tail hundreds of old files.
+ * Keeps the set of streamed sessions in sync with what's active: every
+ * user-started session touched in the last day, whatever folders it was
+ * created with, most recent first. Matching the window's folders used to
+ * drop sessions still running here after a folder was added/removed in the
+ * .code-workspace. With several windows open, the hub keeps only the owner
+ * window's copy of each event.
  */
 function ensureWatchers(config: BridgeConfig): void {
-  const candidates = recentSessionsForThisWindow().slice(0, MAX_WATCHED_SESSIONS);
+  const candidates = recentParentSessions().slice(0, MAX_WATCHED_SESSIONS);
   const wanted = new Set(candidates.map((candidate) => candidate.sessionId));
 
   for (const [sessionId, watcher] of watchers) {
@@ -564,9 +593,11 @@ function watchSessionForReplies(config: BridgeConfig, sessionId: string): void {
     return;
   }
   const messagesPath = join(sessionDir, 'messages.jsonl');
+  const start = startOffset(sessionId, messagesPath);
 
   const watcher: SessionWatcher = {
-    offset: fileSize(messagesPath), // only forward what comes after this point
+    offset: start.offset,
+    catchingUp: start.catchingUp,
     timer: setInterval(() => {
       try {
         tickWatcher(sessionId, messagesPath);
@@ -577,7 +608,42 @@ function watchSessionForReplies(config: BridgeConfig, sessionId: string): void {
   };
 
   watchers.set(sessionId, watcher);
-  log(`Watching ${shortId(sessionId)} (from byte ${watcher.offset}).`);
+  log(`Watching ${shortId(sessionId)} (from byte ${watcher.offset}${start.note}).`);
+}
+
+/**
+ * Where to start tailing a session: where we left off if we know it, byte 0
+ * for a transcript created after this window started (so its first lines
+ * aren't lost to discovery lag), otherwise the end of the file.
+ */
+function startOffset(sessionId: string, messagesPath: string): { offset: number; catchingUp: boolean; note: string } {
+  const size = fileSize(messagesPath);
+  const saved = loadProgress()[sessionId]?.offset;
+
+  if (saved !== undefined && saved <= size) {
+    const backlog = size - saved;
+    if (backlog === 0) return { offset: size, catchingUp: false, note: '' };
+    if (backlog > MAX_CATCHUP_BYTES) {
+      push({
+        type: 'status',
+        text: `Kiro Remote Bridge: ${Math.round(backlog / 1024)} KB desta sessão não foram sincronizados (backlog grande demais). Acompanhando a partir de agora.`,
+        sessionId,
+      });
+      return { offset: size, catchingUp: false, note: `, skipped ${backlog} byte backlog` };
+    }
+    return { offset: saved, catchingUp: true, note: `, catching up ${backlog} bytes` };
+  }
+
+  if (createdAfterActivation(messagesPath)) return { offset: 0, catchingUp: true, note: ', new transcript' };
+  return { offset: size, catchingUp: false, note: '' };
+}
+
+function createdAfterActivation(path: string): boolean {
+  try {
+    return statSync(path).birthtimeMs >= activatedAt;
+  } catch {
+    return false;
+  }
 }
 
 function tickWatcher(sessionId: string, messagesPath: string): void {
@@ -597,13 +663,89 @@ function tickWatcher(sessionId: string, messagesPath: string): void {
   if (lastNewline < 0) return;
 
   watcher.offset += Buffer.byteLength(chunk.slice(0, lastNewline + 1), 'utf8');
-  for (const line of chunk.slice(0, lastNewline).split('\n')) {
-    forwardLine(sessionId, line);
+  const lines = chunk.slice(0, lastNewline).split('\n');
+  // A replayed backlog can hold tool approvals that were already answered;
+  // only the ones still open are worth showing.
+  const answered = watcher.catchingUp ? answeredToolCalls(lines) : new Set<string>();
+  watcher.catchingUp = false;
+  for (const line of lines) {
+    forwardLine(sessionId, line, answered);
+  }
+  recordProgress(sessionId, watcher.offset);
+}
+
+function answeredToolCalls(lines: string[]): Set<string> {
+  const answered = new Set<string>();
+  for (const line of lines) {
+    if (!line.includes('interaction_resolved')) continue;
+    try {
+      const payload = (JSON.parse(line) as { payload?: Record<string, unknown> }).payload;
+      if (payload?.type === 'interaction_resolved' && typeof payload.toolCallId === 'string') {
+        answered.add(payload.toolCallId);
+      }
+    } catch {
+      // not JSON; ignore
+    }
+  }
+  return answered;
+}
+
+// --- forwarding progress (PROGRESS_FILE) ---
+
+type ProgressMap = Record<string, { offset: number; at: number }>;
+
+let progressCache: ProgressMap | undefined;
+const dirtyProgress = new Map<string, number>();
+let progressFlushTimer: NodeJS.Timeout | undefined;
+
+function loadProgress(): ProgressMap {
+  if (!progressCache) progressCache = readProgressFile();
+  return progressCache;
+}
+
+function readProgressFile(): ProgressMap {
+  try {
+    const parsed = JSON.parse(readFileSync(PROGRESS_FILE, 'utf8')) as unknown;
+    return parsed && typeof parsed === 'object' ? (parsed as ProgressMap) : {};
+  } catch {
+    return {};
+  }
+}
+
+function recordProgress(sessionId: string, offset: number): void {
+  dirtyProgress.set(sessionId, offset);
+  loadProgress()[sessionId] = { offset, at: Date.now() };
+  if (!progressFlushTimer) {
+    progressFlushTimer = setTimeout(() => {
+      progressFlushTimer = undefined;
+      flushProgress();
+    }, PROGRESS_FLUSH_MS);
+  }
+}
+
+/** Merges this window's progress into the file (other windows write it too) and drops stale entries. */
+function flushProgress(): void {
+  if (dirtyProgress.size === 0) return;
+  const now = Date.now();
+  const merged = readProgressFile();
+  for (const [sessionId, offset] of dirtyProgress) merged[sessionId] = { offset, at: now };
+  dirtyProgress.clear();
+  for (const [sessionId, entry] of Object.entries(merged)) {
+    if (!entry || typeof entry.at !== 'number' || now - entry.at > PROGRESS_RETENTION_MS) delete merged[sessionId];
+  }
+  progressCache = merged;
+  try {
+    mkdirSync(join(homedir(), '.kiro-remote-agent'), { recursive: true });
+    const tmp = `${PROGRESS_FILE}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(merged));
+    renameSync(tmp, PROGRESS_FILE);
+  } catch (err) {
+    log(`Could not save forwarding progress: ${describeError(err)}`);
   }
 }
 
 /** Turns one messages.jsonl line into a hub event, skipping bookkeeping entries. */
-function forwardLine(sessionId: string, line: string): void {
+function forwardLine(sessionId: string, line: string, answeredInBacklog: Set<string> = new Set()): void {
   if (!line.trim()) return;
   let payload: Record<string, unknown> | undefined;
   try {
@@ -666,7 +808,7 @@ function forwardLine(sessionId: string, line: string): void {
 
   if (type === 'pending_interaction' && payload.interactionType === 'tool_approval') {
     const toolCallId = typeof payload.toolCallId === 'string' ? payload.toolCallId : undefined;
-    if (!toolCallId) return;
+    if (!toolCallId || answeredInBacklog.has(toolCallId)) return;
     const question = typeof payload.question === 'string' ? payload.question : 'tool_approval';
     const title = toolTitleByCallId.get(toolCallId);
     // push_event doesn't return the hub-assigned id synchronously (it's a
@@ -807,13 +949,10 @@ function wasJustDelivered(sessionId: string, text: string): boolean {
 }
 
 /**
- * Sessions of this window's workspace that were modified recently, newest
- * first. Reads only session.json metadata, never the transcripts.
+ * User-started sessions modified recently, newest first. Reads only
+ * session.json metadata, never the transcripts.
  */
-function recentSessionsForThisWindow(): { sessionId: string; modifiedAt: number }[] {
-  const ourPaths = currentWorkspacePaths();
-  if (ourPaths.length === 0) return [];
-
+function recentParentSessions(): { sessionId: string; modifiedAt: number }[] {
   const found: { sessionId: string; modifiedAt: number }[] = [];
   const cutoff = Date.now() - RECENT_WINDOW_MS;
 
@@ -854,8 +993,6 @@ function recentSessionsForThisWindow(): { sessionId: string; modifiedAt: number 
       // start them, and a single workflow spawns many, which would also push
       // the parent session out of the MAX_WATCHED_SESSIONS window.
       if (isChildSessionMeta(parsed)) continue;
-      const sessionPaths = Array.isArray(parsed.workspacePaths) ? parsed.workspacePaths.map(String) : [];
-      if (!sameWorkspace(sessionPaths, ourPaths)) continue;
       found.push({ sessionId, modifiedAt });
     }
   }
@@ -913,47 +1050,6 @@ function readFrom(path: string, start: number, end: number): string {
   } finally {
     closeSync(fd);
   }
-}
-
-/**
- * A session's own session.json records the workspace it was created in. We
- * only handle sessions whose workspace matches this window exactly, so that
- * with several Kiro windows open each one only answers for its own chats.
- */
-function sessionBelongsToThisWindow(sessionId: string): boolean {
-  const sessionPaths = readSessionWorkspacePaths(sessionId);
-  if (!sessionPaths) return false;
-  return sameWorkspace(sessionPaths, currentWorkspacePaths());
-}
-
-function sameWorkspace(sessionPaths: string[], ourPaths: string[]): boolean {
-  if (sessionPaths.length === 0 || ourPaths.length === 0) return false;
-  return (
-    sessionPaths.every((path) => ourPaths.includes(path)) &&
-    ourPaths.every((path) => sessionPaths.includes(path))
-  );
-}
-
-function readSessionWorkspacePaths(sessionId: string): string[] | null {
-  let workspaceDirs: string[];
-  try {
-    workspaceDirs = readdirSync(KIRO_SESSIONS_DIR);
-  } catch {
-    return null;
-  }
-
-  for (const workspaceDir of workspaceDirs) {
-    const candidate = join(KIRO_SESSIONS_DIR, workspaceDir, sessionId, 'session.json');
-    try {
-      if (!statSync(candidate).isFile()) continue;
-      const parsed = JSON.parse(readFileSync(candidate, 'utf8')) as Record<string, unknown>;
-      const paths = Array.isArray(parsed.workspacePaths) ? parsed.workspacePaths.map(String) : [];
-      return paths;
-    } catch {
-      // not this workspace dir, or unreadable — keep looking
-    }
-  }
-  return null;
 }
 
 function currentWorkspacePaths(): string[] {

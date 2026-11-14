@@ -129,6 +129,38 @@ export function isChildSession(sessionId: string): boolean {
   return false;
 }
 
+/** sessionId -> workspacePaths. Kiro fixes them when the session is created, so they're cached forever. */
+const workspacePathsCache = new Map<string, string[]>();
+
+/**
+ * The folders a session was created with, read from its session.json, or
+ * null if the session isn't on disk (yet). Used by the hub to decide which
+ * IDE window owns a session when several are open.
+ */
+export function sessionWorkspacePaths(sessionId: string): string[] | null {
+  const cached = workspacePathsCache.get(sessionId);
+  if (cached) return cached;
+
+  let workspaceDirs: string[];
+  try {
+    workspaceDirs = readdirSync(KIRO_SESSIONS_DIR);
+  } catch {
+    return null;
+  }
+  for (const workspaceDir of workspaceDirs) {
+    try {
+      const raw = readFileSync(join(KIRO_SESSIONS_DIR, workspaceDir, sessionId, 'session.json'), 'utf8');
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const paths = Array.isArray(parsed.workspacePaths) ? parsed.workspacePaths.map(String) : [];
+      workspacePathsCache.set(sessionId, paths);
+      return paths;
+    } catch {
+      // Not in this workspace dir; keep looking.
+    }
+  }
+  return null;
+}
+
 function truncate(text: string, maxLength: number): string {
   return text.length > maxLength ? `${text.slice(0, maxLength)}…` : text;
 }
